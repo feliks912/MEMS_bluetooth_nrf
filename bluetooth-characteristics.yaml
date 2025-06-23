@@ -1,0 +1,102 @@
+{
+    "characteristic_mappings": {
+        "c0dec0fe-0bad-41c7-992f-a5d063dbfeee": {
+            "name": "Battery Level",
+            "description": "Current battery level in percentage (0-100)",
+            "data_type": "uint8",
+            "unit": "%"
+        },
+        "b1eec10a-0007-4d3c-a1ca-ae3e7e098a2b": {
+            "name": "Transmit Power Level",
+            "description": "Transmit power level in dBm",
+            "data_type": "int8",
+            "unit": "dBm",
+            "editing": "selection",
+            "selection_options": [-3, 0, 3, 6, 9]
+        },
+        "00002a00-0000-1000-8000-00805f9b34fb": {
+            "name": "Device Name",
+            "description": "Friendly name of the device",
+            "data_type": "string"
+        },
+        "cabacafe-f00d-4b1b-9b1b-1b1b1b1b1b1": {
+            "name": "Firmware Revision String",
+            "description": "Firmware revision string of the device",
+            "data_type": "string"
+        },
+        "beefc0de-f00d-4d3c-a1ca-ae3e7e098a2b": {
+            "name": "Device Log",
+            "description": "Device log messages",
+            "data_type": "bytes"
+        },
+        "deadc0de-beef-4b1b-9b1b-1b1b1b1b1b1b": {
+            "name": "Memory Allocated Percentage",
+            "description": "Percentage of total memory allocated",
+            "data_type": "uint8",
+            "unit": "%"
+        },
+        "0badf00d-cafe-4b1b-9b1b-2c931b1b1b1b": {
+            "name": "Total Sensor Data",
+            "description": "Total size of sensor data in memory (bytes)",
+            "data_type": "uint32",
+            "unit": "bytes"
+        },
+        "fadebabe-0bad-41c7-992f-a5d063dbfeee": {
+            "name": "Auto Disconnect",
+            "description": "Flag indicating whether to auto-disconnect after sending data (0: No, 1: Yes)",
+            "data_type": "bool",
+            "editing": "checkbox"
+        },
+        "f007face-babe-47f5-b542-bbfd9b436872": {
+            "name": "Response Timeout",
+            "description": "Timeout in milliseconds to wait for a connect response after advertising",
+            "data_type": "uint8",
+            "unit": "ms",
+            "editing": "write",
+            "range": [0, 1000]
+        },
+        "4242c0de-f007-4d3c-a1ca-ae3e7e098a2b": {
+            "name": "Sensor ODR",
+            "description": "Output Data Rate of the sensor in Hz",
+            "data_type": "uint16",
+            "unit": "Hz",
+            "editing": "selection",
+            "selection_options": [100, 200, 500, 1000, 1500, 2500]
+        },
+        "c0debabe-face-4f89-b07d-f9d9b20a76c8": {
+            "name": "Sensor Data",
+            "description": "Raw sensor data",
+            "data_type": "bytes"
+        },
+        "cabba6ee-c0de-4414-a6f6-46a397e18422": {
+            "name": "Sensor Data Clear Bit",
+            "description": "Bit to clear the sensor data buffer (write 1 to clear)",
+            "data_type": "bool",
+            "editing": "checkbox"
+        },
+        "eeafbeef-cafe-4d3c-a1ca-ae3e7e098a2b": {
+            "name": "Advertising Interval (Global)",
+            "description": "Interval between advertising sessions in seconds",
+            "data_type": "uint16",
+            "unit": "s",
+            "editing": "write",
+            "range": [0, 3600]
+        },
+        "babebeef-cafe-4d3c-a1ca-ae3e7e098a2b": {
+            "name": "Advertising Duration",
+            "description": "Duration of a single advertising session in milliseconds",
+            "data_type": "uint16",
+            "unit": "ms",
+            "editing": "write",
+            "range": [0, 1000]
+        },
+        "c0ffee00-babe-4d3c-a1ca-ae3e7e098a2b": {
+            "name": "Advertising Interval (Local)",
+            "description": "Interval at which the embedded BLE core advertises (multiples of 0.625ms)",
+            "data_type": "uint16",
+            "unit": "0.625 ms",
+            "editing": "write",
+            "range": [0, 1000]
+        }
+    }
+}

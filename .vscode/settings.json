@@ -1,0 +1,42 @@
+{
+    "nrf-connect.applications": [
+        "${workspaceFolder}"
+    ],
+    "nrf-connect.debugging.bindings": {
+        "${workspaceFolder}/build/MEMS_bluetooth_nrf": "Launch MEMS_bluetooth_nrf",
+        "${workspaceFolder}/build": "Launch build",
+        "${workspaceFolder}/build/MEMS_bluetooth_nrf/tfm": "Launch build"
+    },
+    "files.associations": {
+        "optional": "c",
+        "ratio": "c",
+        "system_error": "c",
+        "array": "c",
+        "functional": "c",
+        "tuple": "c",
+        "type_traits": "c",
+        "utility": "c",
+        "variant": "c",
+        "__bit_reference": "c",
+        "__functional_base": "c",
+        "__node_handle": "c",
+        "algorithm": "c",
+        "bitset": "c",
+        "chrono": "c",
+        "deque": "c",
+        "__memory": "c",
+        "filesystem": "c",
+        "iterator": "c",
+        "limits": "c",
+        "locale": "c",
+        "memory": "c",
+        "random": "c",
+        "vector": "c",
+        "ndef_file.h": "c",
+        "flash_map.h": "c",
+        "conn.h": "c",
+        "fs.h": "c",
+        "littlefs.h": "c",
+        "fs_sys.h": "c"
+    }
+}
