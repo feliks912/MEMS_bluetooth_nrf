@@ -30,3 +30,12 @@ LED0 indicates BLE core power mode
 LED1 indicates pairing mode
 
 
+## TODO
+Add read and write handlers for characteristics.
+Handle new characteristic values at runtime.
+Create sensor dummy data creator.
+Add dynamic advertising thread.
+Add sleep modes.
+
+
+

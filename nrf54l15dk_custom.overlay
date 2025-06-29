@@ -1,0 +1,6 @@
+/ {
+    chosen {
+        zephyr,littlefs = &storage_partition;
+        //zephyr,settings = &storage_partition;
+    };
+};  

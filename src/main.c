@@ -5,26 +5,52 @@
  */
 
 #include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/addr.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/hci.h>
+
+#include <zephyr/drivers/gpio.h>
+
+#include "lbs.h"
 
 #include <zephyr/settings/settings.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
 #include <zephyr/storage/flash_map.h>
-#include <zephyr/fs/zms.h>
-
-#include <dk_buttons_and_leds.h>
-#include "lbs.h"
 
 #include <zephyr/fs/fs.h>
-#include <zephyr/fs/fs_sys.h>
-#include <zephyr/fs/fs_interface.h>
 #include <zephyr/fs/littlefs.h>
 
+#include <zephyr/pm/device.h>
+#include <zephyr/pm/device_runtime.h>
+#include <zephyr/pm/pm.h>
+#include <zephyr/pm/policy.h>
+#include <zephyr/pm/state.h>
+
+#include <errno.h>
+
+#define BLE_STATIC_ADDR {0xFF, 0x00, 0x11, 0x22, 0x33, 0x33}
+
+#define WORQ_THREAD_STACK_SIZE 2048
+
 LOG_MODULE_REGISTER(main_logger, LOG_LEVEL_DBG);
+
+#define FS_ROOT "/lfs1"
+
+#define FILE_CHAR_LOCATION FS_ROOT "/characteristics"
+#define FILE_SENSOR_DATA_LOCATION FS_ROOT "/sdata"
+#define FILE_LOGS_LOCATION FS_ROOT "/logs"
+
+FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
+static struct fs_mount_t lfs_mnt = {
+	.type = FS_LITTLEFS,
+	.fs_data = &storage,										 // You don't need a separate fs_data struct for LittleFS
+	.storage_dev = (void *)FIXED_PARTITION_ID(littlefs_storage), // Use FIXED_PARTITION_ID
+	.mnt_point = FS_ROOT,										 // Choose a mount point
+};
 
 #ifndef DEVICE_NAME
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
@@ -35,19 +61,24 @@ LOG_MODULE_REGISTER(main_logger, LOG_LEVEL_DBG);
 
 #endif
 
-#define LED_RUN_STATUS DK_LED1
-#define LED_CON_STATUS DK_LED2
+static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
+static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
+static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
+static const struct gpio_dt_spec button3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
+
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+static const struct gpio_dt_spec led3 = GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios);
+
+static struct gpio_callback button0_cb;
+static struct gpio_callback button1_cb;
+static struct gpio_callback button2_cb;
+static struct gpio_callback button3_cb;
+
 #define LED_RUN_BLINK_INTERVAL 1000
 
-#define LED_USER DK_LED3
-
-// Pressing BTN_CONN simulates RTC on regular intervals.
-// Upon pressing it without any bonded devices, pairing mode is activated.
-#define BTN_CONN DK_BTN1_MSK
 static bool pairing_mode = false;
-
-// Delete bond information button
-#define BTN_BOND_DEL DK_BTN2_MSK
 
 #define ADV_INT_MIN BT_GAP_ADV_FAST_INT_MIN_1
 #define ADV_INT_MAX BT_GAP_ADV_FAST_INT_MAX_1
@@ -63,8 +94,8 @@ static bool pairing_mode = false;
 #define BT_LE_ADV_CONN_ACCEPT_LIST BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_FILTER_CONN | BT_LE_ADV_OPT_USE_TX_POWER | BT_LE_ADV_OPT_NO_2M, \
 												   ADV_INT_MIN, ADV_INT_MAX, NULL)
 
-static bool app_button_state;
 static struct k_work adv_work;
+static struct k_work gpio_irq_log_work;
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -74,6 +105,8 @@ static const struct bt_data ad[] = {
 static const struct bt_data sd[] = {
 	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
 };
+
+struct fs_file_t file_g;
 
 static void setup_accept_list_cb(const struct bt_bond_info *info, void *user_data)
 {
@@ -104,7 +137,7 @@ static int setup_accept_list(uint8_t local_id)
 
 	if (err)
 	{
-		LOG_INF("Cannot clear accept list (err: %d)\n", err);
+		LOG_INF("Cannot clear accept list. Err: %d", err);
 		return err;
 	}
 
@@ -182,6 +215,7 @@ static void adv_work_handler(struct k_work *work)
 
 static void advertising_start(void)
 {
+	LOG_DBG("Advertising work submitted.");
 	k_work_submit(&adv_work);
 }
 
@@ -205,7 +239,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 
 	LOG_INF("Connected\n");
 
-	dk_set_led_on(LED_CON_STATUS);
+	gpio_pin_set_dt(&led0, 1);
 }
 
 /** @brief BT disconnection callback
@@ -223,7 +257,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_INF("Disconnected (reason %u)\n", reason);
-	dk_set_led_off(LED_CON_STATUS);
+	gpio_pin_set_dt(&led0, 0);
 }
 
 /** @brief BT connection object is released and ready for use
@@ -407,29 +441,14 @@ static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
 	.pairing_complete = pairing_complete,
 };
 
-static void app_led_cb(bool led_state)
-{
-	dk_set_led(LED_USER, led_state);
-}
-
-static bool app_button_cb(void)
-{
-	return app_button_state;
-}
-
-static struct bt_lbs_cb lbs_callbacks = {
-	.led_cb = app_led_cb,
-	.button_cb = app_button_cb,
-};
-
 static void btn_cb(uint32_t button_state, uint32_t has_changed)
 {
 
 	/* STEP 2.2 - Add extra button handling to remove bond information */
-	if (has_changed & BTN_BOND_DEL)
+	if (has_changed & button2.pin)
 	{
 
-		uint32_t BTN_BOND_DEL_state = button_state & BTN_BOND_DEL;
+		uint32_t BTN_BOND_DEL_state = button_state & button2.pin;
 		if (BTN_BOND_DEL_state == 0)
 		{
 			LOG_INF("Button 1 released.");
@@ -451,9 +470,9 @@ static void btn_cb(uint32_t button_state, uint32_t has_changed)
 	}
 	/* STEP 4.2.2 Add extra button handling pairing mode (advertise without using Accept List) */
 
-	if (has_changed & BTN_CONN)
+	if (has_changed & button3.pin)
 	{
-		uint32_t BTN_PAIR_state = button_state & BTN_CONN;
+		uint32_t BTN_PAIR_state = button_state & button3.pin;
 		if (BTN_PAIR_state == 0)
 		{
 
@@ -475,111 +494,400 @@ static void btn_cb(uint32_t button_state, uint32_t has_changed)
 	}
 }
 
-static int init_button(void)
+const int data_append(const char *filename, const char *data, ssize_t len)
 {
-	int err;
+	int written = 0;
 
-	err = dk_buttons_init(btn_cb);
-	if (err)
+	int err = fs_open(&file_g, filename, FS_O_CREATE | FS_O_APPEND);
+	if (err < 0)
 	{
-		LOG_INF("Cannot init buttons (err: %d)\n", err);
+		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Opened file %s.", filename);
 	}
 
-	return err;
+	err = fs_write(&file_g, data, len);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to write %d bytes to %s. Err %d (%s)", len, filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Written %d bytes to %s.", len, filename);
+		written = err;
+	}
+
+	err = fs_close(&file_g);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Closed file %s", filename);
+	}
+
+	return written;
 }
 
-/* static struct zms_fs fs = {
-	.sector_size = DT_PROP(DT_CHOSEN(zephyr_flash), erase_block_size),
-	.sector_count = 6,
-	.offset = FIXED_PARTITION_OFFSET(storage_partition)};
- */
-int main(void)
+const int data_write(const char *filename, const char *data, ssize_t len)
 {
-	int blink_status = 0;
+	int written = 0;
+
+	int err = fs_open(&file_g, filename, FS_O_CREATE | FS_O_WRITE);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Oppened file %s.", filename);
+	}
+
+	err = fs_seek(&file_g, 0, FS_SEEK_SET);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to set file seek of file %s to 0. Err %d (%s)", filename, err, strerror(-err));
+		return err;
+	}
+
+	err = fs_write(&file_g, data, len);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to append %d bytes to %s. Err %d (%s)", len, filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Written %d bytes to %s.", len, filename);
+		written = err;
+	}
+
+	err = fs_close(&file_g);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Closed file %s", filename);
+	}
+
+	return written;
+}
+
+const int data_read(const char *filename, void *buf, ssize_t offset, ssize_t len)
+{
+	int read = 0;
+
+	int err = fs_open(&file_g, filename, FS_O_READ);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Oppened file %s.", filename);
+	}
+
+	err = fs_seek(&file_g, offset, FS_SEEK_SET);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to set file seek of file %s to %d. Err %d (%s)", filename, offset, err, strerror(-err));
+		return err;
+	}
+
+	err = fs_read(&file_g, buf, len);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to read %d bytes from %s. Err %d (%s)", len, filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Read %d bytes from %s.", len, filename);
+		read = err;
+	}
+
+	err = fs_close(&file_g);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
+		return err;
+	}
+	else
+	{
+		LOG_DBG("Closed file %s", filename);
+	}
+
+	return read;
+}
+
+static void bt_ready(int err)
+{
+	if (err)
+	{
+		LOG_ERR("Bluetooth init failed (err %d)", err);
+		return;
+	}
+
+	LOG_INF("Bluetooth initialized");
+
+	err = settings_load();
+	if (err == 0)
+	{
+		LOG_INF("main: Settings loaded!");
+	}
+	else
+	{
+		LOG_ERR("main: Failed to load settings. Err %d.", err);
+	}
+
+	// All Bluetooth subsystems are ready. Now we can start advertising.
+	advertising_start();
+}
+
+void gpio_cb(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+{
+	k_work_submit(&gpio_irq_log_work);
+}
+
+int init_gpio()
+{
 	int err;
 
-	LOG_INF("Starting Lesson 5 - Exercise 2 \n");
-
-	err = dk_leds_init();
-	if (err)
+	if (!device_is_ready(button0.port))
 	{
-		LOG_INF("LEDs init failed (err %d)\n", err);
+		LOG_ERR("GPIO LEDs port %s is not ready.", led0.port->name);
 		return -1;
 	}
 
-	err = init_button();
-	if (err)
+	err = gpio_pin_configure_dt(&led0, GPIO_OUTPUT_LOW);
+	if (err < 0)
 	{
-		LOG_INF("Button init failed (err %d)\n", err);
+		LOG_ERR("GPIO led0 config failed. Err %d", err);
 		return -1;
 	}
 
-	err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
-	if (err)
+	err = gpio_pin_configure_dt(&led1, GPIO_OUTPUT_LOW);
+	if (err < 0)
 	{
-		LOG_INF("Failed to register authorization information callbacks.\n");
+		LOG_ERR("GPIO led1 config failed. Err %d", err);
 		return -1;
 	}
 
-	err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-	if (err)
+	err = gpio_pin_configure_dt(&led2, GPIO_OUTPUT_LOW);
+	if (err < 0)
 	{
-		LOG_INF("Failed to register authorization callbacks.\n");
+		LOG_ERR("GPIO led2 config failed. Err %d", err);
 		return -1;
 	}
-	bt_conn_cb_register(&connection_callbacks);
 
-	err = bt_enable(NULL);
+	err = gpio_pin_configure_dt(&led3, GPIO_OUTPUT_LOW);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO led3 config failed. Err %d", err);
+		return -1;
+	}
+
+	if (!device_is_ready(button0.port))
+	{
+		LOG_ERR("GPIO buttons port %s is not ready.", button0.port->name);
+		return -1;
+	}
+
+	err = gpio_pin_configure_dt(&button0, GPIO_INPUT);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button0 config failed. Err %d", err);
+		return -1;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&button0, GPIO_INT_EDGE_FALLING);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button0 int config failed. Err %d", err);
+	}
+
+	gpio_init_callback(&button0_cb, gpio_cb, BIT(button0.pin));
+	gpio_add_callback(button0.port, &button0_cb);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button0 callback addition failed. Err %d", err);
+	}
+
+	err = gpio_pin_configure_dt(&button1, GPIO_INPUT);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button1 config failed. Err %d", err);
+		return -1;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&button1, GPIO_INT_EDGE_FALLING);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button1 int config failed. Err %d", err);
+	}
+
+	gpio_init_callback(&button1_cb, gpio_cb, BIT(button1.pin));
+	gpio_add_callback(button1.port, &button1_cb);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button1 callback addition failed. Err %d", err);
+	}
+
+	err = gpio_pin_configure_dt(&button2, GPIO_INPUT);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button2 config failed. Err %d", err);
+		return -1;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&button2, GPIO_INT_EDGE_FALLING);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button2 int config failed. Err %d", err);
+	}
+
+	gpio_init_callback(&button2_cb, gpio_cb, BIT(button2.pin));
+	gpio_add_callback(button2.port, &button2_cb);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button2 callback addition failed. Err %d", err);
+	}
+
+	err = gpio_pin_configure_dt(&button3, GPIO_INPUT);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button3 config failed. Err %d", err);
+		return -1;
+	}
+
+	err = gpio_pin_interrupt_configure_dt(&button3, GPIO_INT_EDGE_FALLING);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button3 int config failed. Err %d", err);
+	}
+
+	gpio_init_callback(&button3_cb, gpio_cb, BIT(button3.pin));
+	gpio_add_callback(button3.port, &button3_cb);
+	if (err < 0)
+	{
+		LOG_ERR("GPIO button3 callback addition failed. Err %d", err);
+	}
+
+	return 0;
+}
+
+
+
+void gpio_irq_log_work_handler(){
+	//printk("HELLO!");
+	gpio_pin_toggle_dt(&led1);
+}
+
+int init_all()
+{
+	int err;
+
+	err = fs_mount(&lfs_mnt);
+	if (err == 0)
+	{
+		LOG_INF("LittleFS mounted successfully at %s", lfs_mnt.mnt_point);
+	}
+	else
+	{
+		LOG_ERR("Failed to mount LittleFS.");
+		return -1;
+	}
+
+	fs_file_t_init(&file_g);
+
+	err = init_gpio();
+	if (err < 0)
+	{
+		LOG_ERR("GPIO init failed.");
+		return -1;
+	}
+	LOG_INF("GPIO init complete.");
+
+	k_work_init(&gpio_irq_log_work, gpio_irq_log_work_handler);
+	k_work_init(&adv_work, adv_work_handler);
+
+	uint8_t addr[] = BLE_STATIC_ADDR;
+
+	addr[5] |= 0xC0;
+
+	bt_addr_le_t le_addr = {
+		.type = BT_ADDR_LE_RANDOM,
+	};
+
+	memcpy(le_addr.a.val, addr, sizeof(addr));
+
+	err = bt_id_create(&le_addr, NULL);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to create BT identity. Err %d (%s)", err, bt_att_err_to_str(err));
+	}
+	else
+	{
+		LOG_INF("Static BT identity %d created.", err);
+	}
+
+	size_t count = CONFIG_BT_ID_MAX;
+	bt_addr_le_t read_addr[CONFIG_BT_ID_MAX];
+	bt_id_get(read_addr, &count);
+
+	if (count > 0)
+	{
+		LOG_INF("Using BLE addr: %02X:%02X:%02X:%02X:%02X:%02X",
+				read_addr[0].a.val[5], read_addr[0].a.val[4], read_addr[0].a.val[3], read_addr[0].a.val[2], read_addr[0].a.val[1], read_addr[0].a.val[0]);
+	}
+	else
+	{
+		LOG_ERR("Can't get BLE addr. Err %d (%s)", count, bt_att_err_to_str(count));
+	}
+
+	err = bt_enable(bt_ready);
 	if (err)
 	{
-		LOG_INF("Bluetooth init failed (err %d)\n", err);
+		LOG_INF("Bluetooth init failed. Err %d (%s)", err, bt_att_err_to_str(err));
 		return -1;
 	}
 
 	LOG_INF("Bluetooth initialized\n");
 
-	/* STEP 1.3 - Add setting load function */
-	settings_load();
+	return 0;
+}
 
-	err = bt_lbs_init(&lbs_callbacks);
-	if (err)
+int main(void)
+{
+
+	LOG_INF("Starting!\n");
+
+	int blink_status = 0;
+	int err;
+
+	err = init_all();
+	if (err < 0)
 	{
-		LOG_INF("Failed to init LBS (err:%d)\n", err);
+		LOG_ERR("main: Initialization failed.");
 		return -1;
 	}
 
-	/* fs.flash_device = FIXED_PARTITION_DEVICE(storage_partition);
-	if (fs.flash_device == NULL)
-	{
-		LOG_ERR("No storage partition device on this board. Failed to init fs.");
-	}
-	else
-	{
-		err = zms_mount(&fs);
-
-		if (err < 0)
-		{
-			LOG_ERR("Can't init fs! %d", err);
-		}
-		else
-		{
-			LOG_INF("fs init success.");
-		}
-	}
-
-	size_t active_sector_free_space = zms_active_sector_free_space(&fs);
-	size_t active_zms_free_space = zms_calc_free_space(&fs);
-
-	LOG_INF("Sector free bytes: %zu. ate_wra: %u, data_wra: %u, ate_size: %zu. ZMS total free space: %zu",
-			active_sector_free_space, fs.ate_wra, fs.data_wra, fs.ate_size, active_zms_free_space); */
-
-	k_work_init(&adv_work, adv_work_handler);
-
-	advertising_start();
+	LOG_INF("Init complete.");
 
 	for (;;)
 	{
-		dk_set_led(LED_RUN_STATUS, (++blink_status) % 2);
+		gpio_pin_set_dt(&led0, (++blink_status) % 2);
 		k_sleep(K_MSEC(LED_RUN_BLINK_INTERVAL));
 	}
 }
