@@ -60,6 +60,12 @@
         "pm.h": "c",
         "policy.h": "c",
         "state.h": "c",
-        "uuid.h": "c"
+        "uuid.h": "c",
+        "byteorder.h": "c",
+        "rtc.h": "c",
+        "nrf_rtc_timer.h": "c",
+        "nrf_grtc_timer.h": "c",
+        "system_timer.h": "c",
+        "kernel.h": "c"
     }
 }

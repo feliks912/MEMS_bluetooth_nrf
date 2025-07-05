@@ -61,6 +61,8 @@ static struct fs_mount_t lfs_mnt = {
 
 #endif
 
+static struct k_timer g_k_timer;
+
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
 static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
@@ -77,25 +79,19 @@ static struct gpio_callback button2_cb;
 static struct gpio_callback button3_cb;
 
 #define LED_RUN_BLINK_INTERVAL 1000
+static struct k_work gpio_irq_log_work;
+
+// ------ ADVERTISING -------
 
 static bool pairing_mode = false;
 
 #define ADV_INT_MIN BT_GAP_ADV_FAST_INT_MIN_1
 #define ADV_INT_MAX BT_GAP_ADV_FAST_INT_MAX_1
 
-// use BT_GAP_MS_TO_ADV_INTERVAL(min_adv_int), BT_GAP_MS_TO_ADV_INTERVAL(max_adv_int) instead of INT_MIN/MAX_1/2 later during testing
-// #define BT_LE_ADV_CONN_ACCEPT_LIST                                                                                                                                                     \
-// 	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_FILTER_CONN | BT_LE_ADV_OPT_USE_TX_POWER | BT_LE_ADV_OPT_NO_2M | BT_LE_ADV_OPT_DISABLE_CHAN_37 | BT_LE_ADV_OPT_DISABLE_CHAN_38, \
-// 					ADV_INT_MIN, ADV_INT_MAX, NULL)
-
-/* #define BT_LE_ADV_CONN_ACCEPT_LIST BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_FILTER_CONN, \
-												   ADV_INT_MIN, ADV_INT_MAX, NULL) */
-
 #define BT_LE_ADV_CONN_ACCEPT_LIST BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_FILTER_CONN | BT_LE_ADV_OPT_USE_TX_POWER | BT_LE_ADV_OPT_NO_2M, \
 												   ADV_INT_MIN, ADV_INT_MAX, NULL)
 
 static struct k_work adv_work;
-static struct k_work gpio_irq_log_work;
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -103,10 +99,10 @@ static const struct bt_data ad[] = {
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_LBS_VAL),
+	BT_DATA_BYTES(BT_DATA_UUID128_SOME, BT_UUID_APP_CONFIG_VAL),
 };
 
-struct fs_file_t file_g;
+static bool advertising_ready = false;
 
 static void setup_accept_list_cb(const struct bt_bond_info *info, void *user_data)
 {
@@ -171,6 +167,7 @@ static void adv_work_handler(struct k_work *work)
 			LOG_INF("Advertising failed to start (err %d)\n", err);
 			return;
 		}
+		advertising_ready = false;
 		LOG_INF("Advertising successfully started\n");
 		return;
 	}
@@ -209,6 +206,7 @@ static void adv_work_handler(struct k_work *work)
 			LOG_INF("Advertising failed to start (err %d)\n", err);
 			return;
 		}
+		advertising_ready = false;
 		LOG_INF("Advertising successfully started\n");
 	}
 }
@@ -218,6 +216,8 @@ static void advertising_start(void)
 	LOG_DBG("Advertising work submitted.");
 	k_work_submit(&adv_work);
 }
+
+// ------ ADVERTISING END -------
 
 // ------- CALLBACKS -------
 
@@ -269,8 +269,9 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
  */
 static void recycled_cb(void)
 {
-	LOG_INF("Connection object available from previous conn. Disconnect/stop advertising is completed!\n");
-	advertising_start();
+	LOG_INF("Connection object available from previous conn. Advertising ready.\n");
+	// advertising_start();
+	advertising_ready = true;
 }
 
 /** @brief BT connection security changed callback
@@ -494,11 +495,17 @@ static void btn_cb(uint32_t button_state, uint32_t has_changed)
 	}
 }
 
+// ------- CALLBACKS END -------
+
+// ------- FLASH ------
+
 const int data_append(const char *filename, const char *data, ssize_t len)
 {
 	int written = 0;
+	struct fs_file_t l_file;
+	fs_file_t_init(&l_file);
 
-	int err = fs_open(&file_g, filename, FS_O_CREATE | FS_O_APPEND);
+	int err = fs_open(&l_file, filename, FS_O_CREATE | FS_O_APPEND);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
@@ -509,10 +516,11 @@ const int data_append(const char *filename, const char *data, ssize_t len)
 		LOG_DBG("Opened file %s.", filename);
 	}
 
-	err = fs_write(&file_g, data, len);
+	err = fs_write(&l_file, data, len);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to write %d bytes to %s. Err %d (%s)", len, filename, err, strerror(-err));
+		fs_close(&l_file);
 		return err;
 	}
 	else
@@ -521,7 +529,7 @@ const int data_append(const char *filename, const char *data, ssize_t len)
 		written = err;
 	}
 
-	err = fs_close(&file_g);
+	err = fs_close(&l_file);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
@@ -538,8 +546,10 @@ const int data_append(const char *filename, const char *data, ssize_t len)
 const int data_write(const char *filename, const char *data, ssize_t len)
 {
 	int written = 0;
+	struct fs_file_t l_file;
+	fs_file_t_init(&l_file);
 
-	int err = fs_open(&file_g, filename, FS_O_CREATE | FS_O_WRITE);
+	int err = fs_open(&l_file, filename, FS_O_CREATE | FS_O_WRITE);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
@@ -550,14 +560,15 @@ const int data_write(const char *filename, const char *data, ssize_t len)
 		LOG_DBG("Oppened file %s.", filename);
 	}
 
-	err = fs_seek(&file_g, 0, FS_SEEK_SET);
+	err = fs_seek(&l_file, 0, FS_SEEK_SET);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to set file seek of file %s to 0. Err %d (%s)", filename, err, strerror(-err));
+		fs_close(&l_file);
 		return err;
 	}
 
-	err = fs_write(&file_g, data, len);
+	err = fs_write(&l_file, data, len);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to append %d bytes to %s. Err %d (%s)", len, filename, err, strerror(-err));
@@ -569,7 +580,7 @@ const int data_write(const char *filename, const char *data, ssize_t len)
 		written = err;
 	}
 
-	err = fs_close(&file_g);
+	err = fs_close(&l_file);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
@@ -586,8 +597,10 @@ const int data_write(const char *filename, const char *data, ssize_t len)
 const int data_read(const char *filename, void *buf, ssize_t offset, ssize_t len)
 {
 	int read = 0;
+	struct fs_file_t l_file;
+	fs_file_t_init(&l_file);
 
-	int err = fs_open(&file_g, filename, FS_O_READ);
+	int err = fs_open(&l_file, filename, FS_O_READ);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
@@ -598,17 +611,19 @@ const int data_read(const char *filename, void *buf, ssize_t offset, ssize_t len
 		LOG_DBG("Oppened file %s.", filename);
 	}
 
-	err = fs_seek(&file_g, offset, FS_SEEK_SET);
+	err = fs_seek(&l_file, offset, FS_SEEK_SET);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to set file seek of file %s to %d. Err %d (%s)", filename, offset, err, strerror(-err));
+		fs_close(&l_file);
 		return err;
 	}
 
-	err = fs_read(&file_g, buf, len);
+	err = fs_read(&l_file, buf, len);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to read %d bytes from %s. Err %d (%s)", len, filename, err, strerror(-err));
+		fs_close(&l_file);
 		return err;
 	}
 	else
@@ -617,7 +632,7 @@ const int data_read(const char *filename, void *buf, ssize_t offset, ssize_t len
 		read = err;
 	}
 
-	err = fs_close(&file_g);
+	err = fs_close(&l_file);
 	if (err < 0)
 	{
 		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
@@ -630,6 +645,134 @@ const int data_read(const char *filename, void *buf, ssize_t offset, ssize_t len
 
 	return read;
 }
+
+// ------- FLASH END ------
+
+// ------- SENSOR -------
+
+typedef struct
+{
+	uint64_t start_time;
+	uint32_t length_time;
+	uint16_t ODR;
+	uint16_t length_data;
+	uint16_t raw_data[];
+} sensor_data_t;
+
+static sensor_data_t **sensor_data_list = NULL;
+
+static size_t sensor_data_list_size = 0;
+static size_t sensor_data_list_capacity = 0;
+
+#define INITIAL_SENSOR_DATA_LIST_CAPACITY 8
+
+bool sensor_data_list_init()
+{
+	if (sensor_data_list != NULL)
+	{
+		return false;
+	}
+
+	sensor_data_list = (sensor_data_t **)malloc(INITIAL_SENSOR_DATA_LIST_CAPACITY * sizeof(sensor_data_t *));
+	if (sensor_data_list == NULL)
+	{
+		sensor_data_list_capacity = 0;
+		sensor_data_list_size = 0;
+		LOG_ERR("Failed to allocate initial sensor_data_t pointer space with malloc.");
+		return false;
+	}
+	sensor_data_list_capacity = INITIAL_SENSOR_DATA_LIST_CAPACITY;
+	sensor_data_list_size = 0;
+	return true;
+}
+
+bool sensor_data_list_add(uint64_t start_time, uint32_t length_time, uint16_t ODR,
+						  uint16_t length_data, const uint16_t *raw_data)
+{
+	if (sensor_data_list_size >= sensor_data_list_capacity)
+	{
+		size_t new_list_capacity = sensor_data_list_capacity + 1;
+		if (new_list_capacity < sensor_data_list_capacity)
+		{
+			LOG_ERR("Sensor data list capacity overflow.");
+			return false;
+		}
+
+		sensor_data_t **temp_list = (sensor_data_t **)realloc(sensor_data_list, new_list_capacity * sizeof(sensor_data_t *));
+		if (temp_list == NULL)
+		{
+			LOG_ERR("Failed to allocate temporary sensor data list with realloc.");
+			return false;
+		}
+		sensor_data_list = temp_list;
+		sensor_data_list_capacity = new_list_capacity;
+	}
+
+	size_t struct_with_data_size = sizeof(sensor_data_t) + (length_data * sizeof(uint8_t));
+	sensor_data_t *new_data = (sensor_data_t *)malloc(struct_with_data_size);
+	if (new_data == NULL)
+	{
+		LOG_ERR("Failed to allocate new sensor data struct with malloc.");
+		return false;
+	}
+
+	new_data->start_time = start_time;
+	new_data->length_time = length_time;
+	new_data->ODR = ODR;
+	new_data->length_data;
+	memcpy(new_data->raw_data, raw_data, length_data * sizeof(uint8_t));
+
+	sensor_data_list[sensor_data_list_size++] = new_data;
+
+	return true;
+}
+
+sensor_data_t *sensor_data_list_get(size_t index)
+{
+	if (index >= sensor_data_list_size)
+	{
+		LOG_ERR("Failed to fetch sensor data element at index %u. Index is out of bounds of sensor_data_list_size (%u)", index, sensor_data_list_size);
+		return NULL;
+	}
+
+	return sensor_data_list[index];
+}
+
+bool sensor_data_list_remove(size_t index)
+{
+	if (index >= sensor_data_list_size)
+	{
+		LOG_ERR("Failed to remove sensor data element at index %d. Index is out of bounds of sensor_data_list_size (%u)", index, sensor_data_list_size);
+		return false;
+	}
+
+	//FIXME: Circular buffer please.
+
+	free(sensor_data_list[index]);
+	sensor_data_list_size--;
+
+	return true;
+}
+
+void sensor_data_list_clear(){
+	if(sensor_data_list == NULL){
+		return;
+	}
+
+	for(size_t i = 0; i <= sensor_data_list_size; i++) {
+		free(sensor_data_list[i]);
+	}
+
+	free(sensor_data_list);
+
+	sensor_data_list = NULL;
+	sensor_data_list_size = 0;
+	sensor_data_list_capacity = 0;	
+}
+
+// ------- SENSOR END -------
+
+// ------- INITIALIZATION --------
 
 static void bt_ready(int err)
 {
@@ -652,12 +795,19 @@ static void bt_ready(int err)
 	}
 
 	// All Bluetooth subsystems are ready. Now we can start advertising.
-	advertising_start();
+	// advertising_start();
+	advertising_ready = true;
 }
 
 void gpio_cb(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
 	k_work_submit(&gpio_irq_log_work);
+}
+
+int64_t dt = 0;
+void timer_check(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+{
+	LOG_INF("dt: %u", k_uptime_delta(&dt));
 }
 
 int init_gpio()
@@ -777,7 +927,7 @@ int init_gpio()
 		LOG_ERR("GPIO button3 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button3_cb, gpio_cb, BIT(button3.pin));
+	gpio_init_callback(&button3_cb, timer_check, BIT(button3.pin));
 	gpio_add_callback(button3.port, &button3_cb);
 	if (err < 0)
 	{
@@ -787,11 +937,16 @@ int init_gpio()
 	return 0;
 }
 
-
-
-void gpio_irq_log_work_handler(){
-	//printk("HELLO!");
-	gpio_pin_toggle_dt(&led1);
+void gpio_irq_log_work_handler()
+{
+	if (advertising_ready)
+	{
+		advertising_start();
+	}
+	else
+	{
+		LOG_INF("Can't manually start advertising, advertising is not ready.");
+	}
 }
 
 int init_all()
@@ -808,8 +963,6 @@ int init_all()
 		LOG_ERR("Failed to mount LittleFS.");
 		return -1;
 	}
-
-	fs_file_t_init(&file_g);
 
 	err = init_gpio();
 	if (err < 0)
@@ -856,6 +1009,24 @@ int init_all()
 		LOG_ERR("Can't get BLE addr. Err %d (%s)", count, bt_att_err_to_str(count));
 	}
 
+	err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+	if (err < 0)
+	{
+		LOG_ERR("Bluetooth connection authentication callbacks failed to register. Err %d", err);
+	}
+
+	err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+	if (err < 0)
+	{
+		LOG_ERR("Bluetooth connection authentication information callbacks failed to register. Err %d", err);
+	}
+
+	err = bt_conn_cb_register(&connection_callbacks);
+	if (err < 0)
+	{
+		LOG_ERR("Bluetooth connection callback failed to register. Err %d", err);
+	}
+
 	err = bt_enable(bt_ready);
 	if (err)
 	{
@@ -868,12 +1039,35 @@ int init_all()
 	return 0;
 }
 
+// ------- INITIALIZATION END --------
+
+// ------- MISCELANEOUS --------
+
+void set_bt_led(bool state)
+{
+	gpio_pin_set_dt(&led1, state);
+}
+
+struct k_work_delayable w_blink;
+
+void blink()
+{
+	gpio_pin_toggle_dt(&led0);
+	k_work_schedule(&w_blink, K_MSEC(1000));
+}
+
+void expiration_fn()
+{
+	LOG_INF("Timer expired. Current uptime is %u ms", k_uptime_get());
+}
+
+// ------- MISCELANEOUS END --------
+
 int main(void)
 {
 
 	LOG_INF("Starting!\n");
 
-	int blink_status = 0;
 	int err;
 
 	err = init_all();
@@ -885,9 +1079,6 @@ int main(void)
 
 	LOG_INF("Init complete.");
 
-	for (;;)
-	{
-		gpio_pin_set_dt(&led0, (++blink_status) % 2);
-		k_sleep(K_MSEC(LED_RUN_BLINK_INTERVAL));
-	}
+	k_work_init_delayable(&w_blink, blink);
+	k_work_schedule(&w_blink, K_MSEC(1000));
 }
