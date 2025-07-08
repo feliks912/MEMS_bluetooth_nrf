@@ -12,6 +12,7 @@ project(NONE)
 target_sources(app PRIVATE
   src/main.c
   src/lbs.c
+  src/flashio.c
 )
 
 # NORDIC SDK APP END

@@ -66,6 +66,13 @@
         "nrf_rtc_timer.h": "c",
         "nrf_grtc_timer.h": "c",
         "system_timer.h": "c",
-        "kernel.h": "c"
+        "kernel.h": "c",
+        "gatt.h": "c",
+        "flashio.h": "c",
+        "hci.h": "c",
+        "addr.h": "c",
+        "log.h": "c",
+        "types.h": "c",
+        "random.h": "c"
     }
 }

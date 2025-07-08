@@ -4,7 +4,17 @@
 
 Code for nRF54l15 SoC on an nRF54l15dk board for low power logging and data transfer of a MEMS microphone.
 
+## To Do
+MTU and connection parameters
+Long data read
+Data circular buffer (file)
+Persistent BLE characteristics
+
 ## Notes
+
+When BLE connects it tells the sensor what the current time is. The value is stored both in a BLE characteristic in flash, and as the first value of the sensor data octet array. The timer is also reset to 0. Each sensor readout stores the sensor value in the array, and resets the timer. The sensor values are reconstructed as the sum of previous timer deltas + current delta + first timestamp.
+
+
 Button 0 simulates BLE wakeup cycle (BLE core wakeup, advertising, connecting, transfering data, ...) Later an RTC will be used each n minutes
 Button 1 resets the bonded devices
 Button 2 simulates sensor data in category 2

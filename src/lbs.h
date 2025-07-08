@@ -94,7 +94,13 @@ extern "C"
 #define BT_UUID_ADVERTISING_DURATION BT_UUID_DECLARE_128(BT_UUID_ADVERTISING_DURATION_VAL)
 #define BT_UUID_ADVERTISING_INTERVAL_LOCAL BT_UUID_DECLARE_128(BT_UUID_ADVERTISING_INTERVAL_LOCAL_VAL)
 
-uint64_t get_sync_unix_time_ms();
+uint64_t get_sync_unix_time_ms(void);
+uint16_t get_sensor_odr_hz(void);
+uint64_t get_uptime_at_sync_ms(void);
+void set_sensor_data_length(uint32_t length);
+uint32_t get_sensor_data_length(void);
+bool get_sensor_data_read_in_progress(void);
+void set_sensor_data_read_in_progress(bool state);
 
 #ifdef __cplusplus
 }

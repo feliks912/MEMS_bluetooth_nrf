@@ -14,6 +14,7 @@
 #include <zephyr/drivers/gpio.h>
 
 #include "lbs.h"
+#include "flashio.h"
 
 #include <zephyr/settings/settings.h>
 #include <zephyr/kernel.h>
@@ -30,19 +31,17 @@
 #include <zephyr/pm/policy.h>
 #include <zephyr/pm/state.h>
 
+#include <zephyr/random/random.h>
+
 #include <errno.h>
 
 #define BLE_STATIC_ADDR {0xFF, 0x00, 0x11, 0x22, 0x33, 0x33}
 
+#define SENSOR_DATA_BUFFER_SIZE_MAX 100
+
 #define WORQ_THREAD_STACK_SIZE 2048
 
 LOG_MODULE_REGISTER(main_logger, LOG_LEVEL_DBG);
-
-#define FS_ROOT "/lfs1"
-
-#define FILE_CHAR_LOCATION FS_ROOT "/characteristics"
-#define FILE_SENSOR_DATA_LOCATION FS_ROOT "/sdata"
-#define FILE_LOGS_LOCATION FS_ROOT "/logs"
 
 FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
 static struct fs_mount_t lfs_mnt = {
@@ -60,8 +59,6 @@ static struct fs_mount_t lfs_mnt = {
 #endif
 
 #endif
-
-static struct k_timer g_k_timer;
 
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
@@ -497,277 +494,220 @@ static void btn_cb(uint32_t button_state, uint32_t has_changed)
 
 // ------- CALLBACKS END -------
 
-// ------- FLASH ------
-
-const int data_append(const char *filename, const char *data, ssize_t len)
-{
-	int written = 0;
-	struct fs_file_t l_file;
-	fs_file_t_init(&l_file);
-
-	int err = fs_open(&l_file, filename, FS_O_CREATE | FS_O_APPEND);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Opened file %s.", filename);
-	}
-
-	err = fs_write(&l_file, data, len);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to write %d bytes to %s. Err %d (%s)", len, filename, err, strerror(-err));
-		fs_close(&l_file);
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Written %d bytes to %s.", len, filename);
-		written = err;
-	}
-
-	err = fs_close(&l_file);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Closed file %s", filename);
-	}
-
-	return written;
-}
-
-const int data_write(const char *filename, const char *data, ssize_t len)
-{
-	int written = 0;
-	struct fs_file_t l_file;
-	fs_file_t_init(&l_file);
-
-	int err = fs_open(&l_file, filename, FS_O_CREATE | FS_O_WRITE);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Oppened file %s.", filename);
-	}
-
-	err = fs_seek(&l_file, 0, FS_SEEK_SET);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to set file seek of file %s to 0. Err %d (%s)", filename, err, strerror(-err));
-		fs_close(&l_file);
-		return err;
-	}
-
-	err = fs_write(&l_file, data, len);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to append %d bytes to %s. Err %d (%s)", len, filename, err, strerror(-err));
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Written %d bytes to %s.", len, filename);
-		written = err;
-	}
-
-	err = fs_close(&l_file);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Closed file %s", filename);
-	}
-
-	return written;
-}
-
-const int data_read(const char *filename, void *buf, ssize_t offset, ssize_t len)
-{
-	int read = 0;
-	struct fs_file_t l_file;
-	fs_file_t_init(&l_file);
-
-	int err = fs_open(&l_file, filename, FS_O_READ);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to open file %s. Err %d (%s)", filename, err, strerror(-err));
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Oppened file %s.", filename);
-	}
-
-	err = fs_seek(&l_file, offset, FS_SEEK_SET);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to set file seek of file %s to %d. Err %d (%s)", filename, offset, err, strerror(-err));
-		fs_close(&l_file);
-		return err;
-	}
-
-	err = fs_read(&l_file, buf, len);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to read %d bytes from %s. Err %d (%s)", len, filename, err, strerror(-err));
-		fs_close(&l_file);
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Read %d bytes from %s.", len, filename);
-		read = err;
-	}
-
-	err = fs_close(&l_file);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to close file %s. Err %d (%s)", filename, err, strerror(-err));
-		return err;
-	}
-	else
-	{
-		LOG_DBG("Closed file %s", filename);
-	}
-
-	return read;
-}
-
-// ------- FLASH END ------
-
 // ------- SENSOR -------
 
 typedef struct
 {
-	uint64_t start_time;
-	uint32_t length_time;
-	uint16_t ODR;
-	uint16_t length_data;
-	uint16_t raw_data[];
+	uint64_t time_delta;
+	uint8_t data_length;
+	uint8_t *raw_data;
 } sensor_data_t;
 
-static sensor_data_t **sensor_data_list = NULL;
+static sensor_data_t sensor_data_buffer[(2 * SENSOR_DATA_BUFFER_SIZE_MAX)]; // 2x for sensor data reading temporary buffer
+static K_MUTEX_DEFINE(sensor_data_buffer_mutex);
 
-static size_t sensor_data_list_size = 0;
-static size_t sensor_data_list_capacity = 0;
+static ssize_t sensor_data_buffer_size = 0;
+static int64_t previous_sync_unix_time_ms = 0;
+static uint64_t previous_sensor_data_time = 0;
 
-#define INITIAL_SENSOR_DATA_LIST_CAPACITY 8
-
-bool sensor_data_list_init()
+sensor_data_t *sensor_data_buffer_element_add()
 {
-	if (sensor_data_list != NULL)
+	int err;
+
+	int64_t sync_unix_time = get_sync_unix_time_ms(); // Get synchronized time from BLE time sync.
+
+	if (sync_unix_time == 0)
 	{
-		return false;
-	}
-
-	sensor_data_list = (sensor_data_t **)malloc(INITIAL_SENSOR_DATA_LIST_CAPACITY * sizeof(sensor_data_t *));
-	if (sensor_data_list == NULL)
-	{
-		sensor_data_list_capacity = 0;
-		sensor_data_list_size = 0;
-		LOG_ERR("Failed to allocate initial sensor_data_t pointer space with malloc.");
-		return false;
-	}
-	sensor_data_list_capacity = INITIAL_SENSOR_DATA_LIST_CAPACITY;
-	sensor_data_list_size = 0;
-	return true;
-}
-
-bool sensor_data_list_add(uint64_t start_time, uint32_t length_time, uint16_t ODR,
-						  uint16_t length_data, const uint16_t *raw_data)
-{
-	if (sensor_data_list_size >= sensor_data_list_capacity)
-	{
-		size_t new_list_capacity = sensor_data_list_capacity + 1;
-		if (new_list_capacity < sensor_data_list_capacity)
-		{
-			LOG_ERR("Sensor data list capacity overflow.");
-			return false;
-		}
-
-		sensor_data_t **temp_list = (sensor_data_t **)realloc(sensor_data_list, new_list_capacity * sizeof(sensor_data_t *));
-		if (temp_list == NULL)
-		{
-			LOG_ERR("Failed to allocate temporary sensor data list with realloc.");
-			return false;
-		}
-		sensor_data_list = temp_list;
-		sensor_data_list_capacity = new_list_capacity;
-	}
-
-	size_t struct_with_data_size = sizeof(sensor_data_t) + (length_data * sizeof(uint8_t));
-	sensor_data_t *new_data = (sensor_data_t *)malloc(struct_with_data_size);
-	if (new_data == NULL)
-	{
-		LOG_ERR("Failed to allocate new sensor data struct with malloc.");
-		return false;
-	}
-
-	new_data->start_time = start_time;
-	new_data->length_time = length_time;
-	new_data->ODR = ODR;
-	new_data->length_data;
-	memcpy(new_data->raw_data, raw_data, length_data * sizeof(uint8_t));
-
-	sensor_data_list[sensor_data_list_size++] = new_data;
-
-	return true;
-}
-
-sensor_data_t *sensor_data_list_get(size_t index)
-{
-	if (index >= sensor_data_list_size)
-	{
-		LOG_ERR("Failed to fetch sensor data element at index %u. Index is out of bounds of sensor_data_list_size (%u)", index, sensor_data_list_size);
+		LOG_ERR("Failed to create sensor data. Attempted to create data before first BLE time synchronization.");
 		return NULL;
 	}
 
-	return sensor_data_list[index];
+	// FIXME: Race condition: If data has been written to flash during BLE transfer, this would delete new data.
+
+	if (sync_unix_time != previous_sync_unix_time_ms && !get_sensor_data_read_in_progress())
+	{ // First sensor readout after BLE time sync and reading sensor data
+		previous_sync_unix_time_ms = sync_unix_time;
+
+		if (sensor_data_buffer_size != 0)
+		{
+			LOG_ERR("Sync unix time says this should be the first sensor readout, but sensor data buffer size is %d", sensor_data_buffer_size);
+			return NULL;
+		}
+		previous_sensor_data_time = get_uptime_at_sync_ms();
+
+		err = data_overwrite(FILE_SENSOR_DATA_LOCATION, &sync_unix_time, sizeof(sync_unix_time));
+		if (err < 0)
+		{
+			LOG_ERR("Failed to write first timestamp to file %s. Data_write returned with %d", FILE_SENSOR_DATA_LOCATION, err);
+			return NULL;
+		}
+
+		set_sensor_data_length(0);
+	}
+
+	int64_t current_uptime = k_uptime_get();
+	int64_t time_delta = current_uptime - previous_sensor_data_time;
+	previous_sensor_data_time = current_uptime;
+
+	uint8_t data_length = sys_rand8_get() % 100 + 1;
+
+	uint8_t *raw_data = (uint8_t *)malloc(data_length * sizeof(uint8_t));
+	if (raw_data == NULL)
+	{
+		LOG_ERR("Failed to allocate memory for raw data.");
+		return NULL;
+	}
+
+	for (uint8_t i = 0; i < data_length; i++)
+	{
+		*(raw_data + i) = sys_rand8_get();
+	}
+
+	sensor_data_t sensor_data = {
+		.time_delta = time_delta,
+		.data_length = data_length,
+		.raw_data = raw_data,
+	};
+
+	err = k_mutex_lock(&sensor_data_buffer_mutex, K_FOREVER);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to lock sensor data buffer mutex. Error %d", err);
+		return NULL;
+	}
+
+	if (sensor_data_buffer_size >= SENSOR_DATA_BUFFER_SIZE_MAX && !get_sensor_data_read_in_progress())
+	{ // Store to flash and reset
+
+		uint64_t total_data_size_bytes = sensor_data_buffer_size * (sizeof(uint64_t) + sizeof(uint8_t));
+
+		for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
+		{
+			total_data_size_bytes += sensor_data_buffer[i].data_length;
+		}
+
+		if (total_data_size_bytes == 0)
+		{
+			LOG_ERR("Total sensor buffer data size in bytes is 0.");
+			k_mutex_unlock(&sensor_data_buffer_mutex);
+			return NULL;
+		}
+
+		uint8_t *data_p = (uint8_t *)malloc(total_data_size_bytes * sizeof(uint8_t));
+		if (data_p == NULL)
+		{
+			LOG_ERR("Failed to allocate memory for sensor data buffer transfer into flash.");
+			k_mutex_unlock(&sensor_data_buffer_mutex);
+			return NULL;
+		}
+
+		uint64_t ptr_offset = 0;
+
+		for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
+		{
+			for (uint8_t j = 0; j < 4; j++)
+			{
+				*(data_p + ptr_offset++) = (sensor_data_buffer[i].time_delta >> (j * 8)) && 0xFF;
+			}
+
+			*(data_p + ptr_offset++) = sensor_data_buffer[i].data_length;
+
+			for (uint8_t j = 0; j < sensor_data_buffer[i].data_length; j++)
+			{
+				*(data_p + ptr_offset++) = *(sensor_data_buffer[i].raw_data + j);
+			}
+
+			free(sensor_data_buffer[i].raw_data);
+			sensor_data_buffer[i].raw_data = NULL;
+		}
+
+		if (ptr_offset != total_data_size_bytes)
+		{
+			LOG_ERR("Total sensor data length in bytes is not equal to pointer offset. Error.");
+			k_mutex_unlock(&sensor_data_buffer_mutex);
+			free(data_p);
+			return NULL;
+		}
+
+		set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
+
+		sensor_data_buffer_size = 0;
+		free(data_p);
+	}
+
+	sensor_data_buffer[sensor_data_buffer_size++] = sensor_data;
+
+	k_mutex_unlock(&sensor_data_buffer_mutex);
+
+	return &sensor_data_buffer[sensor_data_buffer_size - 1];
 }
 
-bool sensor_data_list_remove(size_t index)
+sensor_data_t *sensor_data_buffer_element_get(size_t index)
 {
-	if (index >= sensor_data_list_size)
+	if (index >= sensor_data_buffer_size)
 	{
-		LOG_ERR("Failed to remove sensor data element at index %d. Index is out of bounds of sensor_data_list_size (%u)", index, sensor_data_list_size);
+		LOG_ERR("Failed to fetch sensor data element at index %u. Index is out of bounds of sensor_data_buffer_size (%u)", index, sensor_data_buffer_size);
+		return NULL;
+	}
+
+	return &sensor_data_buffer[index];
+}
+
+bool sensor_data_buffer_element_remove(size_t index)
+{
+	if (index >= sensor_data_buffer_size)
+	{
+		LOG_ERR("Failed to remove sensor data element at index %d. Index is out of bounds of sensor_data_buffer_size (%u)", index, sensor_data_buffer_size);
 		return false;
 	}
 
-	//FIXME: Circular buffer please.
+	// FIXME: Circular buffer please.
 
-	free(sensor_data_list[index]);
-	sensor_data_list_size--;
+	int err = k_mutex_lock(&sensor_data_buffer_mutex, K_FOREVER);
+
+	if (err < 0)
+	{
+		LOG_ERR("Failed to lock sensor data buffer mutex. Err %d", err);
+		return false;
+	}
+
+	free(sensor_data_buffer[index].raw_data);
+
+	sensor_data_buffer[index].raw_data = NULL;
+
+	k_mutex_unlock(&sensor_data_buffer_mutex);
+
+	sensor_data_buffer_size--;
 
 	return true;
 }
 
-void sensor_data_list_clear(){
-	if(sensor_data_list == NULL){
-		return;
+bool sensor_data_buffer_clear()
+{
+	if (sensor_data_buffer_size == 0)
+	{
+		return true;
 	}
 
-	for(size_t i = 0; i <= sensor_data_list_size; i++) {
-		free(sensor_data_list[i]);
+	int err = k_mutex_lock(&sensor_data_buffer_mutex, K_FOREVER);
+
+	if (err < 0)
+	{
+		LOG_ERR("Failed to lock sensor data buffer mutex. Err %d", err);
+		return false;
 	}
 
-	free(sensor_data_list);
+	for (size_t i = 0; i <= sensor_data_buffer_size; i++)
+	{
+		free(sensor_data_buffer[i].raw_data);
+		sensor_data_buffer[i].raw_data = NULL;
+	}
 
-	sensor_data_list = NULL;
-	sensor_data_list_size = 0;
-	sensor_data_list_capacity = 0;	
+	k_mutex_unlock(&sensor_data_buffer_mutex);
+
+	sensor_data_buffer_size = 0;
+
+	return true;
 }
 
 // ------- SENSOR END -------
@@ -807,7 +747,7 @@ void gpio_cb(const struct device *port, struct gpio_callback *cb, gpio_port_pins
 int64_t dt = 0;
 void timer_check(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
-	LOG_INF("dt: %u", k_uptime_delta(&dt));
+	LOG_INF("dt: %llu", k_uptime_delta(&dt));
 }
 
 int init_gpio()
@@ -1058,7 +998,7 @@ void blink()
 
 void expiration_fn()
 {
-	LOG_INF("Timer expired. Current uptime is %u ms", k_uptime_get());
+	LOG_INF("Timer expired. Current uptime is %lld ms", k_uptime_get());
 }
 
 // ------- MISCELANEOUS END --------
