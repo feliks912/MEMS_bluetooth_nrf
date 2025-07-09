@@ -31,7 +31,11 @@
 #include <zephyr/pm/policy.h>
 #include <zephyr/pm/state.h>
 
+#include <zephyr/drivers/timer/system_timer.h>
+
 #include <zephyr/random/random.h>
+
+#include <nrfx_timer.h>
 
 #include <errno.h>
 
@@ -76,11 +80,14 @@ static struct gpio_callback button2_cb;
 static struct gpio_callback button3_cb;
 
 #define LED_RUN_BLINK_INTERVAL 1000
-static struct k_work gpio_irq_log_work;
 
 // ------ ADVERTISING -------
 
 static bool pairing_mode = false;
+static int bt_identity_static = -1;
+static bool advertising_in_progress = false;
+
+static struct k_work_delayable work_adv;
 
 #define ADV_INT_MIN BT_GAP_ADV_FAST_INT_MIN_1
 #define ADV_INT_MAX BT_GAP_ADV_FAST_INT_MAX_1
@@ -88,20 +95,14 @@ static bool pairing_mode = false;
 #define BT_LE_ADV_CONN_ACCEPT_LIST BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_FILTER_CONN | BT_LE_ADV_OPT_USE_TX_POWER | BT_LE_ADV_OPT_NO_2M, \
 												   ADV_INT_MIN, ADV_INT_MAX, NULL)
 
-static struct k_work adv_work;
-
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN),
-};
-
-static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_SOME, BT_UUID_APP_CONFIG_VAL),
+	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN), // TODO: comment out later
 };
 
 static bool advertising_ready = false;
 
-static void setup_accept_list_cb(const struct bt_bond_info *info, void *user_data)
+static void cb_accept_list_cb(const struct bt_bond_info *info, void *user_data)
 {
 	int *bond_cnt = user_data;
 
@@ -124,7 +125,7 @@ static void setup_accept_list_cb(const struct bt_bond_info *info, void *user_dat
 	}
 }
 
-static int setup_accept_list(uint8_t local_id)
+static int accept_list_setup(uint8_t local_id)
 {
 	int err = bt_le_filter_accept_list_clear();
 
@@ -136,14 +137,43 @@ static int setup_accept_list(uint8_t local_id)
 
 	int bond_cnt = 0;
 
-	bt_foreach_bond(local_id, setup_accept_list_cb, &bond_cnt);
+	bt_foreach_bond(local_id, cb_accept_list_cb, &bond_cnt);
 
 	return bond_cnt;
 }
 
-static void adv_work_handler(struct k_work *work)
+static void work_adv_handler(struct k_work *work)
 {
 	int err = 0;
+
+	struct bt_data sd[] = {
+		BT_DATA(BT_DATA_MANUFACTURER_DATA, get_sensor_data_length(), sizeof(uint32_t)),
+	};
+
+	if (advertising_in_progress)
+	{ // Stop advertising and schedule the work to run after adv_dur_ms
+		err = bt_le_adv_stop();
+		if (err < 0)
+		{
+			LOG_ERR("Failed to stop advertising. Err %d", err);
+			return;
+		}
+
+		uint16_t adv_int_g_ms = get_adv_int_g_ms();
+
+		if (adv_int_g_ms == 0)
+		{
+			LOG_ERR("Failed to schedule advertising work. Global advertising interval is %d", adv_int_g_ms);
+			return;
+		}
+
+		LOG_INF("Advertising stopped. Work scheduled after %d.", adv_int_g_ms);
+		advertising_ready = true;
+		advertising_in_progress = false;
+		k_work_schedule(&work_adv, K_MSEC(adv_int_g_ms));
+
+		return;
+	}
 
 	if (pairing_mode == true)
 	{
@@ -164,8 +194,16 @@ static void adv_work_handler(struct k_work *work)
 			LOG_INF("Advertising failed to start (err %d)\n", err);
 			return;
 		}
-		advertising_ready = false;
+
 		LOG_INF("Advertising successfully started\n");
+
+		advertising_ready = false;
+		advertising_in_progress = true;
+
+		uint16_t adv_dur_ms = get_adv_dur_ms();
+
+		k_work_schedule(&work_adv, K_MSEC(adv_dur_ms));
+
 		return;
 	}
 	/* STEP 3.4.1 - Remove the original code that does normal advertising */
@@ -178,43 +216,48 @@ static void adv_work_handler(struct k_work *work)
 	// LOG_INF("Advertising successfully started\n");
 
 	/* STEP 3.4.2 - Start advertising with the Accept List */
-	int allowed_cnt = setup_accept_list(BT_ID_DEFAULT);
-	if (allowed_cnt < 0)
-	{
-		LOG_INF("Acceptlist setup failed (err:%d)\n", allowed_cnt);
-	}
-	else
-	{
-		if (allowed_cnt == 0)
+	if (bt_identity_static != -1)
+	{ // Static BT identity successfuly created.
+		int allowed_cnt = accept_list_setup(bt_identity_static);
+		if (allowed_cnt < 0)
 		{
-			LOG_INF("Advertising with no Accept list \n");
-			err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd,
-								  ARRAY_SIZE(sd));
+			LOG_INF("Acceptlist setup failed (err:%d)\n", allowed_cnt);
 		}
 		else
 		{
-			LOG_INF("Advertising with Accept list \n");
-			LOG_INF("Acceptlist setup number  = %d \n", allowed_cnt);
-			err = bt_le_adv_start(BT_LE_ADV_CONN_ACCEPT_LIST, ad, ARRAY_SIZE(ad), sd,
-								  ARRAY_SIZE(sd));
+			if (allowed_cnt == 0)
+			{
+				LOG_INF("Advertising with no Accept list \n");
+				err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd,
+									  ARRAY_SIZE(sd));
+			}
+			else
+			{
+				LOG_INF("Advertising with Accept list \n");
+				LOG_INF("Acceptlist setup number  = %d \n", allowed_cnt);
+				err = bt_le_adv_start(BT_LE_ADV_CONN_ACCEPT_LIST, ad, ARRAY_SIZE(ad), sd,
+									  ARRAY_SIZE(sd));
+			}
+			if (err)
+			{
+				LOG_INF("Advertising failed to start (err %d)\n", err);
+				return;
+			}
+
+			LOG_INF("Advertising successfully started\n");
+
+			advertising_ready = false;
+			advertising_in_progress = true;
+			k_work_schedule(&work_adv, K_MSEC(get_adv_dur_ms()));
 		}
-		if (err)
-		{
-			LOG_INF("Advertising failed to start (err %d)\n", err);
-			return;
-		}
-		advertising_ready = false;
-		LOG_INF("Advertising successfully started\n");
 	}
 }
 
 static void advertising_start(void)
 {
 	LOG_DBG("Advertising work submitted.");
-	k_work_submit(&adv_work);
+	k_work_schedule(&work_adv, K_NO_WAIT);
 }
-
-// ------ ADVERTISING END -------
 
 // ------- CALLBACKS -------
 
@@ -226,7 +269,7 @@ static void advertising_start(void)
  * @param conn - Connection object.
  * @param err – HCI error. Zero for success, non-zero otherwise.
  */
-static void on_connected(struct bt_conn *conn, uint8_t err)
+static void cb_bt_on_connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err)
 	{
@@ -245,13 +288,13 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
  * Has disconnected, and provides a reason.
  *
  * @note The connection object isn't given to be freed due to
- * the disconnection. Use recycled_cb to reuse the connection object
+ * the disconnection. Use cb_bt_recycled to reuse the connection object
  * when it gets freed.
  *
  * @param conn - Connection object.
  * @param reason – BT_HCI_ERR_* reason for the disconnection.
  */
-static void on_disconnected(struct bt_conn *conn, uint8_t reason)
+static void cb_bt_on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	LOG_INF("Disconnected (reason %u)\n", reason);
 	gpio_pin_set_dt(&led0, 0);
@@ -264,7 +307,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
  *
  * @note "No guarantee. First come, first serve. Treat as ISR."
  */
-static void recycled_cb(void)
+static void cb_bt_recycled(void)
 {
 	LOG_INF("Connection object available from previous conn. Advertising ready.\n");
 	// advertising_start();
@@ -282,7 +325,7 @@ static void recycled_cb(void)
  *
  * @note Unchanged security level means the keys have been reset.
  */
-static void on_security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
+static void cb_bt_on_security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err err)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 
@@ -309,7 +352,7 @@ static void on_security_changed(struct bt_conn *conn, bt_security_t level, enum 
  * @param param - Connection parameters. Can be altered before accepting,
  * which will make the device respond to the request with new parameters.
  */
-static bool on_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
+static bool cb_bt_on_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
 {
 	// TODO: Filter parameters if unacceptable
 
@@ -328,19 +371,19 @@ static bool on_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param
  * @param latency – Connection latency.
  * @param timeout – Connection supervision timeout.
  */
-static void on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
+static void cb_bt_on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
 {
 }
 
 struct bt_conn_cb connection_callbacks = {
-	.connected = on_connected,
-	.disconnected = on_disconnected,
-	.recycled = recycled_cb,
-	.security_changed = on_security_changed,
-	.le_param_req = on_le_param_req,
-	.le_param_updated = on_le_param_updated};
+	.connected = cb_bt_on_connected,
+	.disconnected = cb_bt_on_disconnected,
+	.recycled = cb_bt_recycled,
+	.security_changed = cb_bt_on_security_changed,
+	.le_param_req = cb_bt_on_le_param_req,
+	.le_param_updated = cb_bt_on_le_param_updated};
 
-static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
+static void cb_bt_auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 
@@ -363,7 +406,7 @@ static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
  *
  * @param conn - Connection object
  */
-static void auth_pairing_confirm(struct bt_conn *conn)
+static void cb_bt_auth_pairing_confirm(struct bt_conn *conn)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 
@@ -395,7 +438,7 @@ static void auth_pairing_confirm(struct bt_conn *conn)
  *
  * @param conn - Connection object
  */
-static void auth_cancel(struct bt_conn *conn)
+static void cb_bt_auth_cancel(struct bt_conn *conn)
 {
 
 	// TODO: cancel the pairing button polling job if it exists.
@@ -408,14 +451,14 @@ static void auth_cancel(struct bt_conn *conn)
 }
 
 static struct bt_conn_auth_cb conn_auth_callbacks = {
-	.pairing_confirm = auth_pairing_confirm, // auth_pairing_confirm,
+	.pairing_confirm = cb_bt_auth_pairing_confirm, // cb_bt_auth_pairing_confirm,
 	.passkey_confirm = NULL,
 	.passkey_display = NULL,
-	.cancel = auth_cancel,
+	.cancel = cb_bt_auth_cancel,
 };
 
-static void pairing_failed(struct bt_conn *conn,
-						   enum bt_security_err reason)
+static void cb_bt_pairing_failed(struct bt_conn *conn,
+								 enum bt_security_err reason)
 {
 
 	char addr[BT_ADDR_LE_STR_LEN];
@@ -425,7 +468,7 @@ static void pairing_failed(struct bt_conn *conn,
 	LOG_ERR("Pairing failed with %s. Reason %s", addr, bt_security_err_to_str(reason));
 }
 
-static void pairing_complete(struct bt_conn *conn, bool bonded)
+static void cb_bt_pairing_complete(struct bt_conn *conn, bool bonded)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 
@@ -435,84 +478,73 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
 }
 
 static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
-	.pairing_failed = pairing_failed,
-	.pairing_complete = pairing_complete,
+	.pairing_failed = cb_bt_pairing_failed,
+	.pairing_complete = cb_bt_pairing_complete,
 };
-
-static void btn_cb(uint32_t button_state, uint32_t has_changed)
-{
-
-	/* STEP 2.2 - Add extra button handling to remove bond information */
-	if (has_changed & button2.pin)
-	{
-
-		uint32_t BTN_BOND_DEL_state = button_state & button2.pin;
-		if (BTN_BOND_DEL_state == 0)
-		{
-			LOG_INF("Button 1 released.");
-
-			int err = bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
-			if (err)
-			{
-				LOG_INF("Cannot delete bond (err: %d)\n", err);
-			}
-			else
-			{
-				LOG_INF("Bond deleted succesfully");
-			}
-		}
-		else
-		{
-			LOG_INF("Button 1 pressed.");
-		}
-	}
-	/* STEP 4.2.2 Add extra button handling pairing mode (advertise without using Accept List) */
-
-	if (has_changed & button3.pin)
-	{
-		uint32_t BTN_PAIR_state = button_state & button3.pin;
-		if (BTN_PAIR_state == 0)
-		{
-
-			LOG_INF("Button 0 released.");
-
-			pairing_mode = true;
-			int err_code = bt_le_adv_stop();
-			if (err_code)
-			{
-				LOG_INF("Cannot stop advertising err= %d \n", err_code);
-				return;
-			}
-			// recycled_cb will be called after the advertising stopped we will continue advertise when we receive that callback
-		}
-		else
-		{
-			LOG_INF("Button 0 pressed.");
-		}
-	}
-}
-
-// ------- CALLBACKS END -------
 
 // ------- SENSOR -------
 
+static struct k_work work_sensor_data_gen;
+
 typedef struct
 {
-	uint64_t time_delta;
+	uint32_t time_delta;
 	uint8_t data_length;
 	uint8_t *raw_data;
 } sensor_data_t;
 
-static sensor_data_t sensor_data_buffer[(2 * SENSOR_DATA_BUFFER_SIZE_MAX)]; // 2x for sensor data reading temporary buffer
+static sensor_data_t sensor_data_buffer[(2 * SENSOR_DATA_BUFFER_SIZE_MAX)]; // 2x for storing values during BLE transfer.
 static K_MUTEX_DEFINE(sensor_data_buffer_mutex);
 
 static ssize_t sensor_data_buffer_size = 0;
 static int64_t previous_sync_unix_time_ms = 0;
-static uint64_t previous_sensor_data_time = 0;
+static uint32_t previous_sensor_data_time = 0;
 
-sensor_data_t *sensor_data_buffer_element_add()
+bool sensor_data_buffer_clear();
+
+sensor_data_t sensor_data;
+
+sensor_data_t *sensor_data_generate()
+{
+
+	LOG_INF("Generating sensor data...");
+
+	uint8_t data_length = sys_rand8_get() % 100 + 1;
+
+	if(sensor_data.raw_data != NULL){
+		free(sensor_data.raw_data);
+	}
+
+	uint8_t *raw_data = (uint8_t *)malloc(data_length * sizeof(uint8_t));
+	if (raw_data == NULL)
+	{
+		LOG_ERR("Failed to allocate memory for raw data.");
+		return NULL;
+	}
+
+	for (uint8_t i = 0; i < data_length; i++)
+	{
+		*(raw_data + i) = sys_rand8_get();
+	}
+
+	sensor_data.time_delta = k_uptime_get();
+	sensor_data.data_length = data_length;
+	sensor_data.raw_data = raw_data;
+
+	LOG_INF("Successfully generated sensor data.");
+
+	return &sensor_data;
+}
+
+sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 {
 	int err;
+
+	if (sensor_data == NULL)
+	{
+		LOG_ERR("Failed to add sensor data element to buffer. Sensor data pointer is NULL.");
+		return NULL;
+	}
 
 	int64_t sync_unix_time = get_sync_unix_time_ms(); // Get synchronized time from BLE time sync.
 
@@ -522,10 +554,8 @@ sensor_data_t *sensor_data_buffer_element_add()
 		return NULL;
 	}
 
-	// FIXME: Race condition: If data has been written to flash during BLE transfer, this would delete new data.
-
 	if (sync_unix_time != previous_sync_unix_time_ms && !get_sensor_data_read_in_progress())
-	{ // First sensor readout after BLE time sync and reading sensor data
+	{ // First sensor readout after BLE time sync and after reading sensor data. Prevents data being written to flash during transfer.
 		previous_sync_unix_time_ms = sync_unix_time;
 
 		if (sensor_data_buffer_size != 0)
@@ -543,31 +573,15 @@ sensor_data_t *sensor_data_buffer_element_add()
 		}
 
 		set_sensor_data_length(0);
+
+		LOG_INF("Sensor data in flash has been cleared.");
 	}
 
-	int64_t current_uptime = k_uptime_get();
-	int64_t time_delta = current_uptime - previous_sensor_data_time;
+	uint32_t current_uptime = sensor_data->time_delta;
+
+	sensor_data->time_delta = current_uptime - previous_sensor_data_time;
+
 	previous_sensor_data_time = current_uptime;
-
-	uint8_t data_length = sys_rand8_get() % 100 + 1;
-
-	uint8_t *raw_data = (uint8_t *)malloc(data_length * sizeof(uint8_t));
-	if (raw_data == NULL)
-	{
-		LOG_ERR("Failed to allocate memory for raw data.");
-		return NULL;
-	}
-
-	for (uint8_t i = 0; i < data_length; i++)
-	{
-		*(raw_data + i) = sys_rand8_get();
-	}
-
-	sensor_data_t sensor_data = {
-		.time_delta = time_delta,
-		.data_length = data_length,
-		.raw_data = raw_data,
-	};
 
 	err = k_mutex_lock(&sensor_data_buffer_mutex, K_FOREVER);
 	if (err < 0)
@@ -579,7 +593,9 @@ sensor_data_t *sensor_data_buffer_element_add()
 	if (sensor_data_buffer_size >= SENSOR_DATA_BUFFER_SIZE_MAX && !get_sensor_data_read_in_progress())
 	{ // Store to flash and reset
 
-		uint64_t total_data_size_bytes = sensor_data_buffer_size * (sizeof(uint64_t) + sizeof(uint8_t));
+		LOG_INF("Sensor data buffer filled. Transfer to flash initiated.");
+
+		uint64_t total_data_size_bytes = sensor_data_buffer_size * (sizeof(uint32_t) + sizeof(uint8_t));
 
 		for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
 		{
@@ -629,14 +645,25 @@ sensor_data_t *sensor_data_buffer_element_add()
 			return NULL;
 		}
 
+		err = data_append(FILE_SENSOR_DATA_LOCATION, data_p, total_data_size_bytes);
+		if (err < 0)
+		{
+			LOG_ERR("Failed to append sensor data to flash: %d", err);
+			k_mutex_unlock(&sensor_data_buffer_mutex);
+			free(data_p);
+			return NULL;
+		}
+
 		set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
 
+		sensor_data_buffer_clear();
 		sensor_data_buffer_size = 0;
+
 		free(data_p);
 	}
 
-	sensor_data_buffer[sensor_data_buffer_size++] = sensor_data;
-
+	sensor_data_buffer[sensor_data_buffer_size++] = *sensor_data;
+	
 	k_mutex_unlock(&sensor_data_buffer_mutex);
 
 	return &sensor_data_buffer[sensor_data_buffer_size - 1];
@@ -679,6 +706,8 @@ bool sensor_data_buffer_element_remove(size_t index)
 
 	sensor_data_buffer_size--;
 
+	LOG_INF("Sensor data buffer element at index %d removed.", index);
+
 	return true;
 }
 
@@ -707,10 +736,20 @@ bool sensor_data_buffer_clear()
 
 	sensor_data_buffer_size = 0;
 
+	LOG_INF("Sensor data buffer cleared.");
+
 	return true;
 }
 
-// ------- SENSOR END -------
+// ------- BLINK --------
+
+struct k_work_delayable work_blink;
+
+void work_blink_handler()
+{
+	gpio_pin_toggle_dt(&led0);
+	k_work_schedule(&work_blink, K_MSEC(1000));
+}
 
 // ------- INITIALIZATION --------
 
@@ -739,18 +778,19 @@ static void bt_ready(int err)
 	advertising_ready = true;
 }
 
-void gpio_cb(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+void cb_gpio_data_gen(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
-	k_work_submit(&gpio_irq_log_work);
+	k_work_submit(&work_sensor_data_gen);
 }
 
-int64_t dt = 0;
-void timer_check(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+static struct k_work work_gpio_irq_log;
+
+void cb_gpio_adv(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
-	LOG_INF("dt: %llu", k_uptime_delta(&dt));
+	k_work_submit(&work_gpio_irq_log);
 }
 
-int init_gpio()
+int gpio_init()
 {
 	int err;
 
@@ -807,7 +847,7 @@ int init_gpio()
 		LOG_ERR("GPIO button0 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button0_cb, gpio_cb, BIT(button0.pin));
+	gpio_init_callback(&button0_cb, cb_gpio_adv, BIT(button0.pin));
 	gpio_add_callback(button0.port, &button0_cb);
 	if (err < 0)
 	{
@@ -827,7 +867,7 @@ int init_gpio()
 		LOG_ERR("GPIO button1 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button1_cb, gpio_cb, BIT(button1.pin));
+	gpio_init_callback(&button1_cb, cb_gpio_adv, BIT(button1.pin));
 	gpio_add_callback(button1.port, &button1_cb);
 	if (err < 0)
 	{
@@ -847,7 +887,7 @@ int init_gpio()
 		LOG_ERR("GPIO button2 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button2_cb, gpio_cb, BIT(button2.pin));
+	gpio_init_callback(&button2_cb, cb_gpio_adv, BIT(button2.pin));
 	gpio_add_callback(button2.port, &button2_cb);
 	if (err < 0)
 	{
@@ -867,7 +907,7 @@ int init_gpio()
 		LOG_ERR("GPIO button3 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button3_cb, timer_check, BIT(button3.pin));
+	gpio_init_callback(&button3_cb, cb_gpio_adv, BIT(button3.pin));
 	gpio_add_callback(button3.port, &button3_cb);
 	if (err < 0)
 	{
@@ -877,7 +917,12 @@ int init_gpio()
 	return 0;
 }
 
-void gpio_irq_log_work_handler()
+void work_sensor_data_gen_handler()
+{
+	sensor_data_buffer_element_add(sensor_data_generate());
+}
+
+void work_gpio_irq_log_handler()
 {
 	if (advertising_ready)
 	{
@@ -904,7 +949,7 @@ int init_all()
 		return -1;
 	}
 
-	err = init_gpio();
+	err = gpio_init();
 	if (err < 0)
 	{
 		LOG_ERR("GPIO init failed.");
@@ -912,8 +957,25 @@ int init_all()
 	}
 	LOG_INF("GPIO init complete.");
 
-	k_work_init(&gpio_irq_log_work, gpio_irq_log_work_handler);
-	k_work_init(&adv_work, adv_work_handler);
+	k_work_init(&work_sensor_data_gen, work_sensor_data_gen_handler);
+	k_work_init(&work_gpio_irq_log, work_gpio_irq_log_handler);
+	k_work_init_delayable(&work_adv, work_adv_handler);
+	k_work_init_delayable(&work_blink, work_blink_handler);
+	k_work_schedule(&work_blink, K_NO_WAIT);
+
+	// ------- LOAD CHARACTERISTICS FROM FLASH MEMORY -------
+
+	err = restore_char_values();
+	if (err < 0)
+	{
+		LOG_ERR("Failed to restore characteristics from flash, but since this might be the first time they might not exist. Continuing.");
+	}
+	else
+	{
+		LOG_INF("Successfuly restored characteristics from flash.");
+	}
+
+	// ------- SETUP STATIC RANDOM MAC ADDRESS -------
 
 	uint8_t addr[] = BLE_STATIC_ADDR;
 
@@ -932,6 +994,7 @@ int init_all()
 	}
 	else
 	{
+		bt_identity_static = err;
 		LOG_INF("Static BT identity %d created.", err);
 	}
 
@@ -979,34 +1042,11 @@ int init_all()
 	return 0;
 }
 
-// ------- INITIALIZATION END --------
-
-// ------- MISCELANEOUS --------
-
-void set_bt_led(bool state)
-{
-	gpio_pin_set_dt(&led1, state);
-}
-
-struct k_work_delayable w_blink;
-
-void blink()
-{
-	gpio_pin_toggle_dt(&led0);
-	k_work_schedule(&w_blink, K_MSEC(1000));
-}
-
-void expiration_fn()
-{
-	LOG_INF("Timer expired. Current uptime is %lld ms", k_uptime_get());
-}
-
 // ------- MISCELANEOUS END --------
 
 int main(void)
 {
-
-	LOG_INF("Starting!\n");
+	LOG_INF("Starting init...\n");
 
 	int err;
 
@@ -1018,7 +1058,4 @@ int main(void)
 	}
 
 	LOG_INF("Init complete.");
-
-	k_work_init_delayable(&w_blink, blink);
-	k_work_schedule(&w_blink, K_MSEC(1000));
 }

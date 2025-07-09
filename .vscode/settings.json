@@ -73,6 +73,10 @@
         "addr.h": "c",
         "log.h": "c",
         "types.h": "c",
-        "random.h": "c"
+        "random.h": "c",
+        "printk.h": "c",
+        "errno.h": "c",
+        "compare": "c",
+        "nrfx_timer.h": "c"
     }
 }

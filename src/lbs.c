@@ -28,6 +28,7 @@
 #include "flashio.h"
 
 #include <zephyr/logging/log.h>
+
 LOG_MODULE_REGISTER(bt_logger, LOG_LEVEL_DBG);
 
 #ifndef DEVICE_NAME
@@ -43,12 +44,10 @@ LOG_MODULE_REGISTER(bt_logger, LOG_LEVEL_DBG);
 #define LOG_BUFFER_SIZE 256
 #define SENSOR_DATA_BUFFER_SIZE 512
 #define DEFAULT_RESPONSE_TIMEOUT_MS 1000 // in ms
-#define DEFAULT_SENSOR_ODR_HZ 1000
 #define DEFAULT_SENSOR_DATA_CLEAR_ON_READ false
 #define DEFAULT_ADV_INT_G_MS (60 * 1000) // global advertising interval in ms
 #define DEFAULT_ADV_INT_L_MS 100		 // local advertising interval in ms
 #define DEFAULT_ADV_DUR_MS 500			 // advertising duration in ms
-#define DEFAULT_AUTO_DISCONNECT_BIT false
 
 static K_MUTEX_DEFINE(g_app_config_mutex);
 static K_MUTEX_DEFINE(g_app_runtime_state_mutex);
@@ -101,6 +100,58 @@ static struct disconnect_work m_disconnect_work;
 static app_config_t g_app_config = DEFAULT_APP_CONFIG;
 static app_runtime_state_t g_app_runtime_state;
 
+static void disconnect_work_handler(struct k_work *work);
+int restore_char_values(void);
+static ssize_t read_battery_level(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_memory_aloc_perc(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_device_log_length(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_sensor_data_length(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_adv_dur_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_response_timeout_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t read_transmit_power(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t write_data_clear_disconnect(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t write_adv_dur_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t write_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t write_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t write_response_timeout_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t write_transmit_power(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t write_sync_unix_time_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+void set_transmit_power(int8_t power);
+int8_t get_transmit_power_level(void);
+void set_sync_unix_time_ms(uint64_t time);
+uint64_t get_sync_unix_time_ms(void);
+void set_response_timeout_ms(uint16_t timeout_ms);
+uint16_t get_response_timeout_ms(void);
+void set_adv_int_g_ms(uint16_t interval_ms);
+uint16_t get_adv_int_g_ms(void);
+void set_adv_int_l_ms(uint16_t interval_ms);
+uint16_t get_adv_int_l_ms(void);
+void set_adv_dur_ms(uint16_t duration_ms);
+uint16_t get_adv_dur_ms(void);
+void set_device_name(const char *name);
+const char *get_device_name(void);
+void set_firmware_rev_str(const char *rev_str);
+const char *get_firmware_rev_str(void);
+void set_battery_level(int8_t level);
+uint8_t get_battery_level(void);
+void set_device_log(const uint8_t *log_data, uint16_t len);
+const uint8_t *get_device_log(uint16_t *len_out);
+uint16_t get_device_log_len(void);
+void set_memory_allocation_perc(uint8_t perc);
+uint8_t get_memory_allocation_perc(void);
+void set_sensor_data_length(uint32_t length);
+uint32_t get_sensor_data_length(void);
+void set_sensor_data(const uint8_t *data, uint16_t len);
+const uint8_t *get_sensor_data(uint16_t *len_out);
+void set_uptime_at_sync_ms(uint64_t uptime);
+uint64_t get_uptime_at_sync_ms(void);
+void set_sensor_data_read_in_progress(bool state);
+bool get_sensor_data_read_in_progress(void);
+
 static void disconnect_work_handler(struct k_work *work)
 {
 	// If you used a custom struct like 'disconnect_work'
@@ -114,72 +165,77 @@ static void disconnect_work_handler(struct k_work *work)
 	bt_conn_unref(disconnect_w->conn);
 }
 
-static ssize_t read_battery_level(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-								  uint16_t len, uint16_t offset);
-static ssize_t read_memory_aloc_perc(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-									 uint16_t len, uint16_t offset);
-static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-							   uint16_t len, uint16_t offset);
-static ssize_t read_device_log_length(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-									  uint16_t len, uint16_t offset);
-static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-								uint16_t len, uint16_t offset);
-static ssize_t read_sensor_data_length(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-									   uint16_t len, uint16_t offset);
+int restore_char_values(void)
+{
+	int err;
+	int ret = 0;
 
-static ssize_t read_transmit_power(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-								   uint16_t len, uint16_t offset);
-static ssize_t write_transmit_power(struct bt_conn *conn,
-									const struct bt_gatt_attr *attr,
-									const void *buf, uint16_t len,
-									uint16_t offset, uint8_t flags);
-static ssize_t write_sync_unix_time_ms(struct bt_conn *conn,
-									   const struct bt_gatt_attr *attr,
-									   const void *buf, uint16_t len,
-									   uint16_t offset, uint8_t flags);
-static ssize_t read_auto_disconnect(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-									uint16_t len, uint16_t offset);
-static ssize_t write_auto_disconnect(struct bt_conn *conn,
-									 const struct bt_gatt_attr *attr,
-									 const void *buf, uint16_t len,
-									 uint16_t offset, uint8_t flags);
-static ssize_t read_response_timeout_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-										uint16_t len, uint16_t offset);
-static ssize_t write_response_timeout_ms(struct bt_conn *conn,
-										 const struct bt_gatt_attr *attr,
-										 const void *buf, uint16_t len,
-										 uint16_t offset, uint8_t flags);
-static ssize_t read_sensor_odr(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-							   uint16_t len, uint16_t offset);
-static ssize_t write_sensor_odr(struct bt_conn *conn,
-								const struct bt_gatt_attr *attr,
-								const void *buf, uint16_t len,
-								uint16_t offset, uint8_t flags);
-static ssize_t read_sensor_data_clear_on_read(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-											  uint16_t len, uint16_t offset);
-static ssize_t write_sensor_data_clear_on_read(struct bt_conn *conn,
-											   const struct bt_gatt_attr *attr,
-											   const void *buf, uint16_t len,
-											   uint16_t offset, uint8_t flags);
-static ssize_t read_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-								 uint16_t len, uint16_t offset);
-static ssize_t write_adv_int_l_ms(struct bt_conn *conn,
-								  const struct bt_gatt_attr *attr,
-								  const void *buf, uint16_t len,
-								  uint16_t offset, uint8_t flags);
-static ssize_t read_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-								 uint16_t len, uint16_t offset);
-static ssize_t write_adv_int_g_ms(struct bt_conn *conn,
-								  const struct bt_gatt_attr *attr,
-								  const void *buf, uint16_t len,
-								  uint16_t offset, uint8_t flags);
-static ssize_t read_adv_dur_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
-							   uint16_t len, uint16_t offset);
-static ssize_t write_adv_dur_ms(struct bt_conn *conn,
-								const struct bt_gatt_attr *attr,
-								const void *buf, uint16_t len,
-								uint16_t offset, uint8_t flags);
-void set_uptime_at_sync_ms(uint64_t uptime);
+	int8_t transmit_power;
+	uint16_t response_timeout_ms;
+	uint16_t adv_int_g_ms;
+	uint16_t adv_int_l_ms;
+	uint16_t adv_dur_ms;
+
+	uint16_t device_log_len;
+
+	err = data_read(FILE_BT_CHAR_TRANSMIT_POWER, &transmit_power, 0, sizeof(transmit_power));
+	if (err < 0 || err < sizeof(transmit_power))
+	{
+		LOG_ERR("Failed to restore transmit power from flash. Err %d", err);
+		transmit_power = DEFAULT_TRANSMIT_POWER;
+		ret = -1;
+	}
+
+	err = data_read(FILE_BT_CHAR_RESPONSE_TIMEOUT, &response_timeout_ms, 0, sizeof(response_timeout_ms));
+	if (err < 0 || err < sizeof(response_timeout_ms))
+	{
+		LOG_ERR("Failed to restore response timeout from flash. Err %d", err);
+		response_timeout_ms = DEFAULT_RESPONSE_TIMEOUT_MS;
+		ret = -1;
+	}
+
+	err = data_read(FILE_BT_CHAR_ADVERTISING_INTERVAL_GLOBAL, &adv_int_g_ms, 0, sizeof(adv_int_g_ms));
+	if (err < 0 || err < sizeof(adv_int_g_ms))
+	{
+		LOG_ERR("Failed to restore global advertising interval from flash. Err %d", err);
+		adv_int_g_ms = DEFAULT_ADV_INT_G_MS;
+		ret = -1;
+	}
+
+	err = data_read(FILE_BT_CHAR_ADVERTISING_INTERVAL_LOCAL, &adv_int_l_ms, 0, sizeof(adv_int_l_ms));
+	if (err < 0 || err < sizeof(adv_int_l_ms))
+	{
+		LOG_ERR("Failed to restore local advertising interval from flash. Err %d", err);
+		adv_int_l_ms = DEFAULT_ADV_INT_L_MS;
+		ret = -1;
+	}
+
+	err = data_read(FILE_BT_CHAR_ADVERTISING_DURATION, &adv_dur_ms, 0, sizeof(adv_dur_ms));
+	if (err < 0 || err < sizeof(adv_dur_ms))
+	{
+		LOG_ERR("Failed to restore advertising duration from flash. Err %d", err);
+		adv_dur_ms = DEFAULT_ADV_DUR_MS;
+		ret = -1;
+	}
+
+	err = data_read(FILE_BT_CHAR_DEVICE_LOG_LENGTH, &device_log_len, 0, sizeof(device_log_len));
+	if (err < 0 || err < sizeof(device_log_len))
+	{
+		LOG_ERR("Failed to restore device log length from flash. Err %d", err);
+		adv_dur_ms = 0;
+		ret = -1;
+	}
+
+	g_app_config.transmit_power = transmit_power;
+	g_app_config.response_timeout_ms = response_timeout_ms;
+	g_app_config.adv_int_g_ms = adv_int_g_ms;
+	g_app_config.adv_int_l_ms = adv_int_l_ms;
+	g_app_config.adv_dur_ms = adv_dur_ms;
+
+	g_app_runtime_state.device_log_len = device_log_len;
+
+	return ret; // Indicate success if all attempts were made
+}
 
 BT_GATT_SERVICE_DEFINE(app_runtime_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_APP_RUNTIME),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_BATTERY_LEVEL, BT_GATT_CHRC_READ,
@@ -198,8 +254,10 @@ BT_GATT_SERVICE_DEFINE(app_runtime_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_APP_RUNT
 BT_GATT_SERVICE_DEFINE(app_config_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_APP_CONFIG),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_TRANSMIT_POWER, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 											  BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT, read_transmit_power, write_transmit_power, &g_app_config.transmit_power),
+					   BT_GATT_CHARACTERISTIC(BT_UUID_CLEAR_FLASH_DATA_DISCONNECT_BIT, BT_GATT_CHRC_WRITE,
+											  BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_data_clear_disconnect, NULL),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_UNIX_TIME, BT_GATT_CHRC_WRITE,
-											  BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_sync_unix_time_ms, &g_app_config.sync_unix_time_ms),
+											  BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_sync_unix_time_ms, NULL),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_RESPONSE_TIMEOUT, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 											  BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT, read_response_timeout_ms, write_response_timeout_ms, &g_app_config.response_timeout_ms),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_ADVERTISING_INTERVAL_GLOBAL, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
@@ -212,17 +270,7 @@ BT_GATT_SERVICE_DEFINE(app_config_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_APP_CONFI
 static ssize_t read_battery_level(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 								  uint16_t len, uint16_t offset)
 {
-	uint8_t battery_level;
-	int mutex_err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	battery_level = g_app_runtime_state.battery_level;
-
-	k_mutex_unlock(&g_app_runtime_state_mutex);
+	uint8_t battery_level = get_battery_level();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Battery Level: %u", attr->handle, (void *)conn, battery_level);
 
@@ -232,23 +280,14 @@ static ssize_t read_battery_level(struct bt_conn *conn, const struct bt_gatt_att
 static ssize_t read_memory_aloc_perc(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 									 uint16_t len, uint16_t offset)
 {
-	uint8_t perc;
-	int mutex_err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	perc = g_app_runtime_state.memory_allocation_perc;
-
-	k_mutex_unlock(&g_app_runtime_state_mutex);
+	uint8_t perc = get_memory_allocation_perc();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Mem Alloc Perc: %u", attr->handle, (void *)conn, perc);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &perc, sizeof(perc));
 }
 
+// TODO: Fix this shit
 static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 							   uint16_t len, uint16_t offset)
 {
@@ -288,23 +327,14 @@ static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *
 static ssize_t read_device_log_length(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 									  uint16_t len, uint16_t offset)
 {
-	uint16_t length_val;
-	int mutex_err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	length_val = g_app_runtime_state.device_log_len;
-
-	k_mutex_unlock(&g_app_runtime_state_mutex);
+	uint16_t length_val = get_device_log_len();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Device Log Len: %u", attr->handle, (void *)conn, length_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &length_val, sizeof(length_val));
 }
 
+//TODO: Sync this to a sensor data setter?
 static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 								uint16_t len, uint16_t offset)
 {
@@ -331,6 +361,8 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 	}
 
+	LOG_INF("%d bytes of sensor data read from flash during BLE transfer.", bytes_read);
+
 	k_mutex_unlock(&g_app_runtime_state_mutex);
 
 	return bytes_read;
@@ -339,17 +371,7 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 static ssize_t read_sensor_data_length(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 									   uint16_t len, uint16_t offset)
 {
-	uint32_t length_val;
-	int mutex_err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	length_val = g_app_runtime_state.sensor_data_len;
-
-	k_mutex_unlock(&g_app_runtime_state_mutex);
+	uint32_t length_val = get_sensor_data_length();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Sensor Data Len: %u", attr->handle, (void *)conn, length_val);
 
@@ -359,17 +381,7 @@ static ssize_t read_sensor_data_length(struct bt_conn *conn, const struct bt_gat
 static ssize_t read_adv_dur_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 							   uint16_t len, uint16_t offset)
 {
-	uint16_t duration_val;
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	duration_val = g_app_config.adv_dur_ms;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	uint16_t duration_val = get_adv_dur_ms();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Adv Dur: %u", attr->handle, (void *)conn, duration_val);
 
@@ -379,17 +391,7 @@ static ssize_t read_adv_dur_ms(struct bt_conn *conn, const struct bt_gatt_attr *
 static ssize_t read_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 								 uint16_t len, uint16_t offset)
 {
-	uint16_t interval_val;
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	interval_val = g_app_config.adv_int_g_ms;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	uint16_t interval_val = get_adv_int_g_ms();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Adv Int Global: %u", attr->handle, (void *)conn, interval_val);
 
@@ -399,17 +401,7 @@ static ssize_t read_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr
 static ssize_t read_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 								 uint16_t len, uint16_t offset)
 {
-	uint16_t interval_val;
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	interval_val = g_app_config.adv_int_l_ms;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	uint16_t interval_val = get_adv_int_l_ms();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Adv Int Local: %u", attr->handle, (void *)conn, interval_val);
 
@@ -419,17 +411,7 @@ static ssize_t read_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr
 static ssize_t read_response_timeout_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 										uint16_t len, uint16_t offset)
 {
-	uint16_t timeout_val;
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	timeout_val = g_app_config.response_timeout_ms;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	uint16_t timeout_val = get_response_timeout_ms();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Response Timeout: %u", attr->handle, (void *)conn, timeout_val);
 
@@ -439,17 +421,7 @@ static ssize_t read_response_timeout_ms(struct bt_conn *conn, const struct bt_ga
 static ssize_t read_transmit_power(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 								   uint16_t len, uint16_t offset)
 {
-	int8_t power_val;
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	power_val = g_app_config.transmit_power;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	int8_t power_val = get_transmit_power_level();
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, Transmit Power: %d", attr->handle, (void *)conn, power_val);
 
@@ -522,16 +494,7 @@ static ssize_t write_adv_dur_ms(struct bt_conn *conn,
 
 	uint16_t val = sys_get_le16(buf);
 
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	g_app_config.adv_dur_ms = val;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	set_adv_dur_ms(val);
 
 	return len;
 }
@@ -556,16 +519,7 @@ static ssize_t write_adv_int_g_ms(struct bt_conn *conn,
 
 	uint16_t val = sys_get_le16(buf);
 
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	g_app_config.adv_int_g_ms = val;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	set_adv_int_g_ms(val);
 
 	return len;
 }
@@ -590,16 +544,7 @@ static ssize_t write_adv_int_l_ms(struct bt_conn *conn,
 
 	uint16_t val = sys_get_le16(buf);
 
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	g_app_config.adv_int_l_ms = val;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	set_adv_int_l_ms(val);
 
 	return len;
 }
@@ -630,16 +575,7 @@ static ssize_t write_response_timeout_ms(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	g_app_config.response_timeout_ms = val;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	set_response_timeout_ms(val);
 
 	return len;
 }
@@ -671,16 +607,7 @@ static ssize_t write_transmit_power(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	g_app_config.transmit_power = val;
-
-	k_mutex_unlock(&g_app_config_mutex);
+	set_transmit_power(val);
 
 	return len;
 }
@@ -703,18 +630,9 @@ static ssize_t write_sync_unix_time_ms(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
-	uint64_t sync_unix_time_ms = sys_get_le64(buf);
+	uint64_t val = sys_get_le64(buf);
 
-	int mutex_err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_config_mutex: %d", mutex_err);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
-
-	g_app_config.sync_unix_time_ms = sync_unix_time_ms; // Protected write
-
-	k_mutex_unlock(&g_app_config_mutex);
+	set_sync_unix_time_ms(val);
 
 	set_uptime_at_sync_ms(k_uptime_get());
 
@@ -731,6 +649,13 @@ void set_transmit_power(int8_t power)
 		LOG_ERR("Failed to lock g_app_config_mutex: %d", ret);
 		return;
 	}
+
+	ret = data_overwrite(FILE_BT_CHAR_TRANSMIT_POWER, &power, sizeof(int8_t));
+	if (ret < 0)
+	{
+		LOG_ERR("Failed to store transmit power to flash. Err %d", ret);
+	}
+
 	g_app_config.transmit_power = power;
 	k_mutex_unlock(&g_app_config_mutex);
 }
@@ -783,6 +708,13 @@ void set_response_timeout_ms(uint16_t timeout_ms)
 		LOG_ERR("Failed to lock g_app_config_mutex: %d", ret);
 		return;
 	}
+
+	ret = data_overwrite(FILE_BT_CHAR_RESPONSE_TIMEOUT, &timeout_ms, sizeof(uint16_t));
+	if (ret < 0)
+	{
+		LOG_ERR("Failed to store response timeout to flash. Err %d", ret);
+	}
+
 	g_app_config.response_timeout_ms = timeout_ms;
 	k_mutex_unlock(&g_app_config_mutex);
 }
@@ -809,6 +741,13 @@ void set_adv_int_g_ms(uint16_t interval_ms)
 		LOG_ERR("Failed to lock g_app_config_mutex: %d", ret);
 		return;
 	}
+
+	ret = data_overwrite(FILE_BT_CHAR_ADVERTISING_INTERVAL_GLOBAL, &interval_ms, sizeof(uint16_t));
+	if (ret < 0)
+	{
+		LOG_ERR("Failed to store advertising interval global to flash. Err %d", ret);
+	}
+
 	g_app_config.adv_int_g_ms = interval_ms;
 	k_mutex_unlock(&g_app_config_mutex);
 }
@@ -835,6 +774,13 @@ void set_adv_int_l_ms(uint16_t interval_ms)
 		LOG_ERR("Failed to lock g_app_config_mutex: %d", ret);
 		return;
 	}
+
+	ret = data_overwrite(FILE_BT_CHAR_ADVERTISING_INTERVAL_LOCAL, &interval_ms, sizeof(uint16_t));
+	if (ret < 0)
+	{
+		LOG_ERR("Failed to store advertising interval local to flash. Err %d", ret);
+	}
+
 	g_app_config.adv_int_l_ms = interval_ms;
 	k_mutex_unlock(&g_app_config_mutex);
 }
@@ -861,6 +807,13 @@ void set_adv_dur_ms(uint16_t duration_ms)
 		LOG_ERR("Failed to lock g_app_config_mutex: %d", ret);
 		return;
 	}
+
+	ret = data_overwrite(FILE_BT_CHAR_ADVERTISING_DURATION, &duration_ms, sizeof(uint16_t));
+	if (ret < 0)
+	{
+		LOG_ERR("Failed to store advertising duration to flash. Err %d", ret);
+	}
+
 	g_app_config.adv_dur_ms = duration_ms;
 	k_mutex_unlock(&g_app_config_mutex);
 }
@@ -949,6 +902,7 @@ uint8_t get_battery_level(void)
 	return value;
 }
 
+// TODO: replace set and get device log from flash directly.
 void set_device_log(const uint8_t *log_data, uint16_t len)
 {
 	int ret = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
@@ -1050,6 +1004,8 @@ uint32_t get_sensor_data_length(void)
 	k_mutex_unlock(&g_app_runtime_state_mutex);
 	return value;
 }
+
+// ------- RUNTIME VARIABLES GETTERS AND SETTERS --------
 
 void set_sensor_data(const uint8_t *data, uint16_t len)
 {

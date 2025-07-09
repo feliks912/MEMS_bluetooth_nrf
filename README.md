@@ -6,9 +6,9 @@ Code for nRF54l15 SoC on an nRF54l15dk board for low power logging and data tran
 
 ## To Do
 MTU and connection parameters
-Long data read
-Data circular buffer (file)
-Persistent BLE characteristics
+Long data read (done?)
+Data circular buffer (file) (done)
+Persistent BLE characteristics (done)
 
 ## Notes
 
