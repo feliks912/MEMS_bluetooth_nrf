@@ -49,6 +49,8 @@ extern "C"
     BT_UUID_128_ENCODE(0x0badf00d, 0xcafe, 0x4b1b, 0x9b1b, 0x2c931b1b1b1b)
 #define BT_UUID_RESPONSE_TIMEOUT_VAL \
     BT_UUID_128_ENCODE(0xf007face, 0xbabe, 0x47f5, 0xb542, 0xbbfd9b436872)
+    #define BT_UUID_SENSOR_DATA_READ_CONFIRM_VAL \
+    BT_UUID_128_ENCODE(0x0badf00d, 0xbabe, 0x47f5, 0xb542, 0xbbfd9b436872)
 #define BT_UUID_SENSOR_DATA_VAL \
     BT_UUID_128_ENCODE(0xc0debabe, 0xface, 0x4f89, 0xb07d, 0xf9d9b20a76c8)
 #define BT_UUID_CLEAR_FLASH_DATA_DISCONNECT_BIT_VAL \
@@ -73,14 +75,12 @@ extern "C"
 #define BT_UUID_MEMORY_ALLOCATED_PERCENTAGE BT_UUID_DECLARE_128(BT_UUID_MEMORY_ALLOCATED_PERCENTAGE_VAL)
 #define BT_UUID_SENSOR_DATA_LENGTH BT_UUID_DECLARE_128(BT_UUID_SENSOR_DATA_LENGTH_VAL)
 #define BT_UUID_RESPONSE_TIMEOUT BT_UUID_DECLARE_128(BT_UUID_RESPONSE_TIMEOUT_VAL)
+#define BT_UUID_SENSOR_DATA_READ_CONFIRM BT_UUID_DECLARE_128(BT_UUID_SENSOR_DATA_READ_CONFIRM_VAL)
 #define BT_UUID_SENSOR_DATA BT_UUID_DECLARE_128(BT_UUID_SENSOR_DATA_VAL)
 #define BT_UUID_CLEAR_FLASH_DATA_DISCONNECT_BIT BT_UUID_DECLARE_128(BT_UUID_CLEAR_FLASH_DATA_DISCONNECT_BIT_VAL)
 #define BT_UUID_ADVERTISING_INTERVAL_GLOBAL BT_UUID_DECLARE_128(BT_UUID_ADVERTISING_INTERVAL_GLOBAL_VAL)
 #define BT_UUID_ADVERTISING_DURATION BT_UUID_DECLARE_128(BT_UUID_ADVERTISING_DURATION_VAL)
 #define BT_UUID_ADVERTISING_INTERVAL_LOCAL BT_UUID_DECLARE_128(BT_UUID_ADVERTISING_INTERVAL_LOCAL_VAL)
-
-#define FILE_BT_CHAR_DEVICE_LOG FILE_CHAR_LOCATION "/dev_log"
-#define FILE_BT_CHAR_DEVICE_LOG_LENGTH FILE_CHAR_LOCATION "/dev_log_len"
 
 #define FILE_BT_CHAR_TRANSMIT_POWER FILE_CHAR_LOCATION "/t_power"
 #define FILE_BT_CHAR_RESPONSE_TIMEOUT FILE_CHAR_LOCATION "/resp_timeout"
@@ -88,10 +88,12 @@ extern "C"
 #define FILE_BT_CHAR_ADVERTISING_DURATION FILE_CHAR_LOCATION "/adv_dur"
 #define FILE_BT_CHAR_ADVERTISING_INTERVAL_LOCAL FILE_CHAR_LOCATION "/adv_int_l"
 
-int restore_char_values(void);
+#define FILE_BT_CHAR_DEVICE_LOG_LENGTH FILE_CHAR_LOCATION "/dev_log_len"
+#define FILE_BT_CHAR_SENSOR_DATA_LENGTH FILE_CHAR_LOCATION "/s_data_len"
+
+int char_init_values(void);
 
 uint64_t get_sync_unix_time_ms(void);
-uint16_t get_sensor_odr_hz(void);
 uint64_t get_uptime_at_sync_ms(void);
 void set_sensor_data_length(uint32_t length);
 uint32_t get_sensor_data_length(void);
@@ -99,6 +101,7 @@ bool get_sensor_data_read_in_progress(void);
 void set_sensor_data_read_in_progress(bool state);
 uint16_t get_adv_dur_ms(void);
 uint16_t get_adv_int_g_ms(void);
+int register_device_initialized_p(bool *device_initialized);
 
 #ifdef __cplusplus
 }

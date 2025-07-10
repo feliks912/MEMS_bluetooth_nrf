@@ -9,6 +9,13 @@ MTU and connection parameters
 Long data read (done?)
 Data circular buffer (file) (done)
 Persistent BLE characteristics (done)
+mutex on flash io
+local adv interval?
+flash case read 0 lenght
+calculate remaining memory percentage
+put all peripheral to deep sleep during timeout
+fix transfer length issues
+check for space left before appending, otherwise only some bytes might get appended.
 
 ## Notes
 

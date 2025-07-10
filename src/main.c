@@ -41,7 +41,7 @@
 
 #define BLE_STATIC_ADDR {0xFF, 0x00, 0x11, 0x22, 0x33, 0x33}
 
-#define SENSOR_DATA_BUFFER_SIZE_MAX 100
+#define SENSOR_DATA_BUFFER_SIZE_MAX 10
 
 #define WORQ_THREAD_STACK_SIZE 2048
 
@@ -89,6 +89,20 @@ static bool advertising_in_progress = false;
 
 static struct k_work_delayable work_adv;
 
+struct adv_mfg_data
+{
+	uint16_t company_id;
+	bool device_initialized;
+	uint16_t sensor_data_length;
+} __packed;
+
+// FIXME: Set device initialized when unix timestamp has ben
+static struct adv_mfg_data app_adv_mfg_data = {
+	.company_id = CONFIG_BT_COMPANY_ID,
+	.device_initialized = false,
+	.sensor_data_length = 0,
+};
+
 #define ADV_INT_MIN BT_GAP_ADV_FAST_INT_MIN_1
 #define ADV_INT_MAX BT_GAP_ADV_FAST_INT_MAX_1
 
@@ -98,6 +112,10 @@ static struct k_work_delayable work_adv;
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME, DEVICE_NAME_LEN), // TODO: comment out later
+};
+
+struct bt_data sd[] = {
+	BT_DATA(BT_DATA_MANUFACTURER_DATA, (unsigned char *)&app_adv_mfg_data, sizeof(struct adv_mfg_data)),
 };
 
 static bool advertising_ready = false;
@@ -146,10 +164,6 @@ static void work_adv_handler(struct k_work *work)
 {
 	int err = 0;
 
-	struct bt_data sd[] = {
-		BT_DATA(BT_DATA_MANUFACTURER_DATA, get_sensor_data_length(), sizeof(uint32_t)),
-	};
-
 	if (advertising_in_progress)
 	{ // Stop advertising and schedule the work to run after adv_dur_ms
 		err = bt_le_adv_stop();
@@ -174,6 +188,8 @@ static void work_adv_handler(struct k_work *work)
 
 		return;
 	}
+
+	app_adv_mfg_data.sensor_data_length = get_sensor_data_length();
 
 	if (pairing_mode == true)
 	{
@@ -234,7 +250,7 @@ static void work_adv_handler(struct k_work *work)
 			else
 			{
 				LOG_INF("Advertising with Accept list \n");
-				LOG_INF("Acceptlist setup number  = %d \n", allowed_cnt);
+				LOG_INF("Acceptlist setup number = %d \n", allowed_cnt);
 				err = bt_le_adv_start(BT_LE_ADV_CONN_ACCEPT_LIST, ad, ARRAY_SIZE(ad), sd,
 									  ARRAY_SIZE(sd));
 			}
@@ -244,7 +260,7 @@ static void work_adv_handler(struct k_work *work)
 				return;
 			}
 
-			LOG_INF("Advertising successfully started\n");
+			LOG_INF("Advertising successfully started. Will advertise for %d milliseconds", get_adv_dur_ms());
 
 			advertising_ready = false;
 			advertising_in_progress = true;
@@ -260,6 +276,30 @@ static void advertising_start(void)
 }
 
 // ------- CALLBACKS -------
+
+static void update_data_length(struct bt_conn *conn)
+{
+	int err;
+	struct bt_conn_le_data_len_param my_data_len = {
+		.tx_max_len = BT_GAP_DATA_LEN_MAX,
+		.tx_max_time = BT_GAP_DATA_TIME_MAX,
+	};
+	err = bt_conn_le_data_len_update(conn, &my_data_len);
+	if (err)
+	{
+		LOG_ERR("data_len_update failed (err %d)", err);
+	}
+}
+
+void on_le_data_len_updated(struct bt_conn *conn, struct bt_conn_le_data_len_info *info)
+{
+	uint16_t tx_len = info->tx_max_len;
+	uint16_t tx_time = info->tx_max_time;
+	uint16_t rx_len = info->rx_max_len;
+	uint16_t rx_time = info->rx_max_time;
+	LOG_INF("Data length updated. Length %d/%d bytes, time %d/%d us", tx_len, rx_len, tx_time, rx_time);
+	LOG_INF("New MTU: %d bytes", bt_gatt_get_mtu(conn) - 3);
+}
 
 /** @brief BT connection (pariring procedure) callback
  *
@@ -277,7 +317,12 @@ static void cb_bt_on_connected(struct bt_conn *conn, uint8_t err)
 		return;
 	}
 
-	LOG_INF("Connected\n");
+	LOG_INF("Connected. Requesting data length and mtu updates.");
+
+	update_data_length(conn);
+	// update_mtu(conn);
+
+	LOG_INF("Connected. MTU is %u, uatt MTU is %d\n", bt_gatt_get_mtu(conn), bt_gatt_get_uatt_mtu(conn));
 
 	gpio_pin_set_dt(&led0, 1);
 }
@@ -356,7 +401,7 @@ static bool cb_bt_on_le_param_req(struct bt_conn *conn, struct bt_le_conn_param 
 {
 	// TODO: Filter parameters if unacceptable
 
-	LOG_INF("On_le_param_req triggered.");
+	LOG_INF("cb_bt_on_le_param_req triggered.");
 
 	return true;
 }
@@ -373,6 +418,7 @@ static bool cb_bt_on_le_param_req(struct bt_conn *conn, struct bt_le_conn_param 
  */
 static void cb_bt_on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
 {
+	LOG_INF("cb_bt_on_le_param_updated triggered.");
 }
 
 struct bt_conn_cb connection_callbacks = {
@@ -381,7 +427,9 @@ struct bt_conn_cb connection_callbacks = {
 	.recycled = cb_bt_recycled,
 	.security_changed = cb_bt_on_security_changed,
 	.le_param_req = cb_bt_on_le_param_req,
-	.le_param_updated = cb_bt_on_le_param_updated};
+	.le_param_updated = cb_bt_on_le_param_updated,
+	.le_data_len_updated = on_le_data_len_updated,
+};
 
 static void cb_bt_auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 {
@@ -506,12 +554,12 @@ sensor_data_t sensor_data;
 
 sensor_data_t *sensor_data_generate()
 {
-
 	LOG_INF("Generating sensor data...");
 
 	uint8_t data_length = sys_rand8_get() % 100 + 1;
 
-	if(sensor_data.raw_data != NULL){
+	if (sensor_data.raw_data != NULL)
+	{
 		free(sensor_data.raw_data);
 	}
 
@@ -531,9 +579,58 @@ sensor_data_t *sensor_data_generate()
 	sensor_data.data_length = data_length;
 	sensor_data.raw_data = raw_data;
 
-	LOG_INF("Successfully generated sensor data.");
+	LOG_INF("Generated sensor data sample of %d elements at time %d.", sensor_data.data_length, sensor_data.time_delta);
 
 	return &sensor_data;
+}
+
+uint32_t log_total_data_length_in_flash = 0;
+
+#define HEX_CHUNK_BUFFER_SIZE_BYTES 16 // How many raw bytes to process in one hex formatting chunk
+#define HEX_OUTPUT_STRING_LEN (HEX_CHUNK_BUFFER_SIZE_BYTES * 3 + 1) // (16*2 for hex chars) + (16-1 for spaces) + 1 for null terminator = 32 + 15 + 1 = 48
+
+// Helper function to print a specific buffer in hex
+void print_buffer_hex(const uint8_t *buffer, size_t length)
+{
+    // Use a local static buffer to avoid stack overflow for large lengths,
+    // and to persist between calls if needed (though not strictly necessary here).
+    // The buffer size is chosen to be reasonable for a single printk call.
+    char hex_string_buffer[HEX_OUTPUT_STRING_LEN];
+    int hex_string_idx;
+
+    size_t current_offset = 0;
+
+    while (current_offset < length) {
+        // Determine how many raw bytes to process in this chunk
+        size_t bytes_to_process = length - current_offset;
+        if (bytes_to_process > HEX_CHUNK_BUFFER_SIZE_BYTES) {
+            bytes_to_process = HEX_CHUNK_BUFFER_SIZE_BYTES;
+        }
+
+        hex_string_idx = 0; // Reset index for the new hex string chunk
+
+        // Format the raw bytes into a hexadecimal string
+        for (size_t k = 0; k < bytes_to_process; k++) {
+            // Convert byte to two hex characters
+            // Use static const char for hex_digits to avoid re-initialization
+            static const char hex_digits[] = "0123456789abcdef";
+            hex_string_buffer[hex_string_idx++] = hex_digits[(buffer[current_offset + k] >> 4) & 0xF];
+            hex_string_buffer[hex_string_idx++] = hex_digits[buffer[current_offset + k] & 0xF];
+
+            // Add a space between hex values for readability, except after the last byte of the chunk
+            if (k < bytes_to_process - 1) {
+                hex_string_buffer[hex_string_idx++] = ' ';
+            }
+        }
+        // Null-terminate the formatted hex string
+        hex_string_buffer[hex_string_idx] = '\0';
+
+        // Print the entire formatted string with a single printk call
+        printk("%s", hex_string_buffer); // Add newline after each chunk
+
+        // Advance the offset
+        current_offset += bytes_to_process;
+    }
 }
 
 sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
@@ -550,7 +647,7 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 
 	if (sync_unix_time == 0)
 	{
-		LOG_ERR("Failed to create sensor data. Attempted to create data before first BLE time synchronization.");
+		LOG_ERR("Failed to add sensor data element to buffer. Attempted to create data before first BLE time synchronization.");
 		return NULL;
 	}
 
@@ -558,26 +655,27 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 	{ // First sensor readout after BLE time sync and after reading sensor data. Prevents data being written to flash during transfer.
 		previous_sync_unix_time_ms = sync_unix_time;
 
+		// Race conditioning, if sensor data is created during BLE transfer they will be larger than 0.
 		if (sensor_data_buffer_size != 0)
 		{
-			LOG_ERR("Sync unix time says this should be the first sensor readout, but sensor data buffer size is %d", sensor_data_buffer_size);
-			return NULL;
+			LOG_INF("Sync unix time says this should be the first sensor readout, but sensor data buffer size is %d", sensor_data_buffer_size);
 		}
 		previous_sensor_data_time = get_uptime_at_sync_ms();
 
 		err = data_overwrite(FILE_SENSOR_DATA_LOCATION, &sync_unix_time, sizeof(sync_unix_time));
 		if (err < 0)
 		{
-			LOG_ERR("Failed to write first timestamp to file %s. Data_write returned with %d", FILE_SENSOR_DATA_LOCATION, err);
+			LOG_ERR("Failed to add sensor data element to buffer. Failed to write first timestamp to file %s. Data_write returned with %d", FILE_SENSOR_DATA_LOCATION, err);
 			return NULL;
 		}
 
 		set_sensor_data_length(0);
+		log_total_data_length_in_flash = 0;
 
 		LOG_INF("Sensor data in flash has been cleared.");
 	}
 
-	uint32_t current_uptime = sensor_data->time_delta;
+	uint32_t current_uptime = sensor_data->time_delta; // k_sys_uptime_get has been stored in time_delta
 
 	sensor_data->time_delta = current_uptime - previous_sensor_data_time;
 
@@ -655,15 +753,24 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 		}
 
 		set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
+		log_total_data_length_in_flash += sensor_data_buffer_size;
 
 		sensor_data_buffer_clear();
 		sensor_data_buffer_size = 0;
 
+		//print_buffer_hex(data_p, total_data_size_bytes);
+
 		free(data_p);
+
+		//print_zephyr_fs_details();
 	}
 
 	sensor_data_buffer[sensor_data_buffer_size++] = *sensor_data;
-	
+
+	LOG_INF("Sensor data info: timestamp[ms]: %d, data length: %d", sensor_data->time_delta, sensor_data->data_length);
+
+	LOG_INF("Added sensor data element to sensor data buffer. Sensor data buffer's length is now %d. Total sensor data length in flash is %d", sensor_data_buffer_size, log_total_data_length_in_flash);
+
 	k_mutex_unlock(&sensor_data_buffer_mutex);
 
 	return &sensor_data_buffer[sensor_data_buffer_size - 1];
@@ -778,6 +885,26 @@ static void bt_ready(int err)
 	advertising_ready = true;
 }
 
+bool gen_working = false;
+
+struct k_work_delayable work_sensor_data_gen_delayable;
+
+void cb_gpio_data_gen_scheduled(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+{
+	if (gen_working)
+	{
+		k_work_cancel_delayable(&work_sensor_data_gen_delayable);
+		gen_working = false;
+		LOG_INF("DATA GEN CANCELLED.");
+	}
+	else
+	{
+		LOG_INF("DATA GEN STARTED.");
+		k_work_schedule(&work_sensor_data_gen_delayable, K_NO_WAIT);
+		gen_working = true;
+	}
+}
+
 void cb_gpio_data_gen(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
 	k_work_submit(&work_sensor_data_gen);
@@ -867,7 +994,7 @@ int gpio_init()
 		LOG_ERR("GPIO button1 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button1_cb, cb_gpio_adv, BIT(button1.pin));
+	gpio_init_callback(&button1_cb, NULL, BIT(button1.pin));
 	gpio_add_callback(button1.port, &button1_cb);
 	if (err < 0)
 	{
@@ -887,7 +1014,7 @@ int gpio_init()
 		LOG_ERR("GPIO button2 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button2_cb, cb_gpio_adv, BIT(button2.pin));
+	gpio_init_callback(&button2_cb, cb_gpio_data_gen_scheduled, BIT(button2.pin));
 	gpio_add_callback(button2.port, &button2_cb);
 	if (err < 0)
 	{
@@ -907,7 +1034,7 @@ int gpio_init()
 		LOG_ERR("GPIO button3 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button3_cb, cb_gpio_adv, BIT(button3.pin));
+	gpio_init_callback(&button3_cb, cb_gpio_data_gen, BIT(button3.pin));
 	gpio_add_callback(button3.port, &button3_cb);
 	if (err < 0)
 	{
@@ -915,6 +1042,12 @@ int gpio_init()
 	}
 
 	return 0;
+}
+
+void work_sensor_data_gen_delayable_handler()
+{
+	sensor_data_buffer_element_add(sensor_data_generate());
+	k_work_schedule(&work_sensor_data_gen_delayable, K_MSEC(500));
 }
 
 void work_sensor_data_gen_handler()
@@ -949,6 +1082,8 @@ int init_all()
 		return -1;
 	}
 
+	print_zephyr_fs_details();
+
 	err = gpio_init();
 	if (err < 0)
 	{
@@ -963,9 +1098,18 @@ int init_all()
 	k_work_init_delayable(&work_blink, work_blink_handler);
 	k_work_schedule(&work_blink, K_NO_WAIT);
 
+	k_work_init_delayable(&work_sensor_data_gen_delayable, work_sensor_data_gen_delayable_handler);
+
+	err = register_device_initialized_p(&app_adv_mfg_data.device_initialized);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to register device initialized pointer. Returning.");
+		return -1;
+	}
+
 	// ------- LOAD CHARACTERISTICS FROM FLASH MEMORY -------
 
-	err = restore_char_values();
+	err = char_init_values();
 	if (err < 0)
 	{
 		LOG_ERR("Failed to restore characteristics from flash, but since this might be the first time they might not exist. Continuing.");

@@ -40,6 +40,8 @@ LOG_MODULE_REGISTER(bt_logger, LOG_LEVEL_DBG);
 
 #endif
 
+#define BT_LONG_TRANSFER_SIZE_BYTES_MAX 500
+
 #define DEFAULT_TRANSMIT_POWER 0 // in dB
 #define LOG_BUFFER_SIZE 256
 #define SENSOR_DATA_BUFFER_SIZE 512
@@ -47,7 +49,7 @@ LOG_MODULE_REGISTER(bt_logger, LOG_LEVEL_DBG);
 #define DEFAULT_SENSOR_DATA_CLEAR_ON_READ false
 #define DEFAULT_ADV_INT_G_MS (60 * 1000) // global advertising interval in ms
 #define DEFAULT_ADV_INT_L_MS 100		 // local advertising interval in ms
-#define DEFAULT_ADV_DUR_MS 500			 // advertising duration in ms
+#define DEFAULT_ADV_DUR_MS 5000			 // advertising duration in ms
 
 static K_MUTEX_DEFINE(g_app_config_mutex);
 static K_MUTEX_DEFINE(g_app_runtime_state_mutex);
@@ -57,6 +59,9 @@ static uint64_t uptime_at_sync_ms = 0;
 
 static K_MUTEX_DEFINE(sensor_data_read_in_progress_mutex);
 static bool sensor_data_read_in_progress = false;
+static uint32_t sensor_data_chunk_offset = 0;
+
+static bool *device_initialized_p;
 
 typedef struct
 {
@@ -76,7 +81,7 @@ typedef struct
 	uint8_t memory_allocation_perc;
 	uint8_t log_data[LOG_BUFFER_SIZE];
 	uint16_t device_log_len;
-	uint8_t sensor_data[SENSOR_DATA_BUFFER_SIZE];
+	uint8_t sensor_data[BT_LONG_TRANSFER_SIZE_BYTES_MAX];
 	uint16_t sensor_data_len;
 } app_runtime_state_t;
 
@@ -101,7 +106,7 @@ static app_config_t g_app_config = DEFAULT_APP_CONFIG;
 static app_runtime_state_t g_app_runtime_state;
 
 static void disconnect_work_handler(struct k_work *work);
-int restore_char_values(void);
+int char_init_values(void);
 static ssize_t read_battery_level(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_memory_aloc_perc(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
@@ -113,13 +118,14 @@ static ssize_t read_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr
 static ssize_t read_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_response_timeout_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
 static ssize_t read_transmit_power(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset);
+static ssize_t write_sensor_data_read_confirm(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 static ssize_t write_data_clear_disconnect(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 static ssize_t write_adv_dur_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 static ssize_t write_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 static ssize_t write_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 static ssize_t write_response_timeout_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 static ssize_t write_transmit_power(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
-static ssize_t write_sync_unix_time_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t write_unix_time_sync_ms(struct bt_conn *conn, const struct bt_gatt_attr *attr, const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 void set_transmit_power(int8_t power);
 int8_t get_transmit_power_level(void);
 void set_sync_unix_time_ms(uint64_t time);
@@ -151,6 +157,8 @@ void set_uptime_at_sync_ms(uint64_t uptime);
 uint64_t get_uptime_at_sync_ms(void);
 void set_sensor_data_read_in_progress(bool state);
 bool get_sensor_data_read_in_progress(void);
+int register_device_initialized_p(bool *device_initialized);
+bool *get_device_initialized_p(void);
 
 static void disconnect_work_handler(struct k_work *work)
 {
@@ -165,10 +173,12 @@ static void disconnect_work_handler(struct k_work *work)
 	bt_conn_unref(disconnect_w->conn);
 }
 
-int restore_char_values(void)
+int char_init_values(void)
 {
 	int err;
 	int ret = 0;
+
+	LOG_INF("Starting characteristing initalization function.");
 
 	int8_t transmit_power;
 	uint16_t response_timeout_ms;
@@ -176,54 +186,156 @@ int restore_char_values(void)
 	uint16_t adv_int_l_ms;
 	uint16_t adv_dur_ms;
 
+	uint32_t sensor_data_length;
 	uint16_t device_log_len;
 
-	err = data_read(FILE_BT_CHAR_TRANSMIT_POWER, &transmit_power, 0, sizeof(transmit_power));
-	if (err < 0 || err < sizeof(transmit_power))
+	// create /lfs1/characteristics directory if it doesn't exist.
+	err = create_directory(FILE_CHAR_LOCATION);
+	if (err < 0)
 	{
-		LOG_ERR("Failed to restore transmit power from flash. Err %d", err);
+		LOG_ERR("Failed to create directory for characteristics. Returning.");
+		return err;
+	}
+
+	err = data_read(FILE_BT_CHAR_TRANSMIT_POWER, &transmit_power, 0, sizeof(transmit_power));
+	if (err <= 0 || err < sizeof(transmit_power))
+	{
 		transmit_power = DEFAULT_TRANSMIT_POWER;
-		ret = -1;
+		if (err == 0)
+		{
+			err = data_overwrite(FILE_BT_CHAR_TRANSMIT_POWER, &transmit_power, sizeof(transmit_power));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to overwrite transmit power to flash. Err %d", err);
+			}
+		}
+		else
+		{
+			LOG_ERR("Failed to restore transmit power from flash. Err %d", err);
+		}
+		ret = err;
 	}
 
 	err = data_read(FILE_BT_CHAR_RESPONSE_TIMEOUT, &response_timeout_ms, 0, sizeof(response_timeout_ms));
-	if (err < 0 || err < sizeof(response_timeout_ms))
+	if (err <= 0 || err < sizeof(response_timeout_ms))
 	{
-		LOG_ERR("Failed to restore response timeout from flash. Err %d", err);
 		response_timeout_ms = DEFAULT_RESPONSE_TIMEOUT_MS;
-		ret = -1;
+		if (err == 0)
+		{
+			err = data_overwrite(FILE_BT_CHAR_RESPONSE_TIMEOUT, &response_timeout_ms, sizeof(response_timeout_ms));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to overwrite response timeout to flash. Err %d", err);
+			}
+		}
+		else
+		{
+			LOG_ERR("Failed to restore response timeout from flash. Err %d", err);
+		}
+		ret = err;
 	}
 
 	err = data_read(FILE_BT_CHAR_ADVERTISING_INTERVAL_GLOBAL, &adv_int_g_ms, 0, sizeof(adv_int_g_ms));
-	if (err < 0 || err < sizeof(adv_int_g_ms))
+	if (err <= 0 || err < sizeof(adv_int_g_ms))
 	{
-		LOG_ERR("Failed to restore global advertising interval from flash. Err %d", err);
 		adv_int_g_ms = DEFAULT_ADV_INT_G_MS;
-		ret = -1;
+		if (err == 0)
+		{
+			err = data_overwrite(FILE_BT_CHAR_ADVERTISING_INTERVAL_GLOBAL, &adv_int_g_ms, sizeof(adv_int_g_ms));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to overwrite global advertising interval to flash. Err %d", err);
+			}
+		}
+		else
+		{
+
+			LOG_ERR("Failed to restore global advertising interval from flash. Err %d", err);
+		}
+		ret = err;
 	}
 
 	err = data_read(FILE_BT_CHAR_ADVERTISING_INTERVAL_LOCAL, &adv_int_l_ms, 0, sizeof(adv_int_l_ms));
-	if (err < 0 || err < sizeof(adv_int_l_ms))
+	if (err <= 0 || err < sizeof(adv_int_l_ms))
 	{
-		LOG_ERR("Failed to restore local advertising interval from flash. Err %d", err);
 		adv_int_l_ms = DEFAULT_ADV_INT_L_MS;
-		ret = -1;
+		if (err == 0)
+		{
+			err = data_overwrite(FILE_BT_CHAR_ADVERTISING_INTERVAL_LOCAL, &adv_int_l_ms, sizeof(adv_int_l_ms));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to overwrite local advertising interval to flash. Err %d", err);
+			}
+		}
+		else
+		{
+			LOG_ERR("Failed to restore local advertising interval from flash. Err %d", err);
+		}
+		ret = err;
 	}
 
 	err = data_read(FILE_BT_CHAR_ADVERTISING_DURATION, &adv_dur_ms, 0, sizeof(adv_dur_ms));
-	if (err < 0 || err < sizeof(adv_dur_ms))
+	if (err <= 0 || err < sizeof(adv_dur_ms))
 	{
-		LOG_ERR("Failed to restore advertising duration from flash. Err %d", err);
 		adv_dur_ms = DEFAULT_ADV_DUR_MS;
-		ret = -1;
+		if (err == 0)
+		{
+			err = data_overwrite(FILE_BT_CHAR_ADVERTISING_DURATION, &adv_dur_ms, sizeof(adv_dur_ms));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to overwrite advertising duration to flash. Err %d", err);
+			}
+		}
+		else
+		{
+			LOG_ERR("Failed to restore advertising duration from flash. Err %d", err);
+		}
+		ret = err;
 	}
 
 	err = data_read(FILE_BT_CHAR_DEVICE_LOG_LENGTH, &device_log_len, 0, sizeof(device_log_len));
-	if (err < 0 || err < sizeof(device_log_len))
+	if (err <= 0 || err < sizeof(device_log_len))
 	{
-		LOG_ERR("Failed to restore device log length from flash. Err %d", err);
-		adv_dur_ms = 0;
-		ret = -1;
+		device_log_len = 0;
+		if (err == 0)
+		{
+			err = data_overwrite(FILE_BT_CHAR_DEVICE_LOG_LENGTH, &device_log_len, sizeof(device_log_len));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to overwrite device log length to flash. Err %d", err);
+			}
+		}
+		else
+		{
+			LOG_ERR("Failed to restore device log length from flash. Err %d", err);
+		}
+		ret = err;
+	}
+
+	err = data_read(FILE_BT_CHAR_SENSOR_DATA_LENGTH, &sensor_data_length, 0, sizeof(sensor_data_length));
+	if (err <= 0 || err < sizeof(sensor_data_length))
+	{
+		sensor_data_length = 0;
+		if (err == 0)
+		{
+			err = data_overwrite(FILE_BT_CHAR_SENSOR_DATA_LENGTH, &sensor_data_length, sizeof(sensor_data_length));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to overwrite sensor data length to flash. Err %d", err);
+			}
+		}
+		else
+		{
+			LOG_ERR("Failed to restore sensor data length from flash. Err %d", err);
+		}
+		ret = err;
+	}
+
+	err = k_mutex_lock(&g_app_config_mutex, K_FOREVER);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to lock g_app_config_mutex: %d", err);
+		return -1;
 	}
 
 	g_app_config.transmit_power = transmit_power;
@@ -232,9 +344,35 @@ int restore_char_values(void)
 	g_app_config.adv_int_l_ms = adv_int_l_ms;
 	g_app_config.adv_dur_ms = adv_dur_ms;
 
-	g_app_runtime_state.device_log_len = device_log_len;
+	k_mutex_unlock(&g_app_config_mutex);
 
-	return ret; // Indicate success if all attempts were made
+	err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", err);
+		return -1;
+	}
+
+	g_app_runtime_state.device_log_len = device_log_len;
+	g_app_runtime_state.sensor_data_len = sensor_data_length;
+
+	k_mutex_unlock(&g_app_runtime_state_mutex);
+
+	// ------ INITIALIZE FLASH FOR OTHER VARIABLES -------
+	err = data_read(FILE_SENSOR_DATA_LOCATION, NULL, 0, 0);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to read or create sensor data file. Err %d", err);
+	}
+	err = data_read(FILE_LOGS_LOCATION, NULL, 0, 0);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to read or create device log file. Err %d", err);
+	}
+
+	LOG_INF("Ending characteristing initalization function.");
+
+	return ret;
 }
 
 BT_GATT_SERVICE_DEFINE(app_runtime_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_APP_RUNTIME),
@@ -243,21 +381,24 @@ BT_GATT_SERVICE_DEFINE(app_runtime_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_APP_RUNT
 					   BT_GATT_CHARACTERISTIC(BT_UUID_MEMORY_ALLOCATED_PERCENTAGE, BT_GATT_CHRC_READ,
 											  BT_GATT_PERM_READ_ENCRYPT, read_memory_aloc_perc, NULL, &g_app_runtime_state.memory_allocation_perc),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_DEVICE_LOG, BT_GATT_CHRC_READ,
-											  BT_GATT_PERM_READ_ENCRYPT, read_device_log, NULL, &g_app_runtime_state.log_data[0]),
+											  BT_GATT_PERM_READ_ENCRYPT, read_device_log, NULL, NULL),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_DEVICE_LOG_LENGTH, BT_GATT_CHRC_READ,
 											  BT_GATT_PERM_READ_ENCRYPT, read_device_log_length, NULL, &g_app_runtime_state.device_log_len),
+
 					   BT_GATT_CHARACTERISTIC(BT_UUID_SENSOR_DATA, BT_GATT_CHRC_READ,
-											  BT_GATT_PERM_READ_ENCRYPT, read_sensor_data, NULL, &g_app_runtime_state.sensor_data[0]),
+											  BT_GATT_PERM_READ_ENCRYPT, read_sensor_data, NULL, NULL),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_SENSOR_DATA_LENGTH, BT_GATT_CHRC_READ,
 											  BT_GATT_PERM_READ_ENCRYPT, read_sensor_data_length, NULL, &g_app_runtime_state.sensor_data_len), );
 
 BT_GATT_SERVICE_DEFINE(app_config_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_APP_CONFIG),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_TRANSMIT_POWER, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 											  BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT, read_transmit_power, write_transmit_power, &g_app_config.transmit_power),
+					   BT_GATT_CHARACTERISTIC(BT_UUID_SENSOR_DATA_READ_CONFIRM, BT_GATT_CHRC_WRITE,
+											  BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_sensor_data_read_confirm, NULL),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_CLEAR_FLASH_DATA_DISCONNECT_BIT, BT_GATT_CHRC_WRITE,
 											  BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_data_clear_disconnect, NULL),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_UNIX_TIME, BT_GATT_CHRC_WRITE,
-											  BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_sync_unix_time_ms, NULL),
+											  BT_GATT_PERM_WRITE_ENCRYPT, NULL, write_unix_time_sync_ms, NULL),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_RESPONSE_TIMEOUT, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 											  BT_GATT_PERM_READ_ENCRYPT | BT_GATT_PERM_WRITE_ENCRYPT, read_response_timeout_ms, write_response_timeout_ms, &g_app_config.response_timeout_ms),
 					   BT_GATT_CHARACTERISTIC(BT_UUID_ADVERTISING_INTERVAL_GLOBAL, BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
@@ -294,8 +435,6 @@ static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *
 	const uint8_t *log_data;
 	uint16_t log_data_len;
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p", attr->handle, (void *)conn);
-
 	int mutex_err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
 	if (mutex_err != 0)
 	{
@@ -303,13 +442,15 @@ static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 	}
 
+	LOG_DBG("Attribute read, handle: %u, conn: %p", attr->handle, (void *)conn);
+
 	// Access protected data
 	log_data = g_app_runtime_state.log_data;
 	log_data_len = g_app_runtime_state.device_log_len;
 
 	if (offset >= log_data_len)
 	{
-		LOG_DBG("Read beyond current data length: offset %u >= log_data_len %u", offset, log_data_len);
+		LOG_ERR("Read beyond current data length: offset %u >= log_data_len %u", offset, log_data_len);
 		k_mutex_unlock(&g_app_runtime_state_mutex);
 		return 0;
 	}
@@ -334,14 +475,14 @@ static ssize_t read_device_log_length(struct bt_conn *conn, const struct bt_gatt
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &length_val, sizeof(length_val));
 }
 
-//TODO: Sync this to a sensor data setter?
+// TODO: Sync this to a sensor data setter?
 static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 								uint16_t len, uint16_t offset)
 {
 
 	set_sensor_data_read_in_progress(true);
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p", attr->handle, (void *)conn);
+	LOG_DBG("BT conn MTU during data transfer is: %d", bt_gatt_get_mtu(conn));
 
 	int mutex_err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
 	if (mutex_err != 0)
@@ -352,7 +493,7 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 	}
 
 	// TODO: Add check
-	ssize_t bytes_read = data_read(FILE_SENSOR_DATA_LOCATION, buf, offset, len);
+	ssize_t bytes_read = data_read(FILE_SENSOR_DATA_LOCATION, buf, sensor_data_chunk_offset, BT_LONG_TRANSFER_SIZE_BYTES_MAX);
 	if (bytes_read < 0)
 	{
 		LOG_ERR("Failed to read sensor data from flash %d", bytes_read);
@@ -361,9 +502,9 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 	}
 
-	LOG_INF("%d bytes of sensor data read from flash during BLE transfer.", bytes_read);
-
 	k_mutex_unlock(&g_app_runtime_state_mutex);
+
+	LOG_DBG("Attribute read, handle: %u, conn: %p, offset: %d, requested length: %d, total read: %d", attr->handle, (void *)conn, offset, len, bytes_read);
 
 	return bytes_read;
 }
@@ -430,35 +571,65 @@ static ssize_t read_transmit_power(struct bt_conn *conn, const struct bt_gatt_at
 
 // --- Write handlers ---
 
+static ssize_t write_sensor_data_read_confirm(struct bt_conn *conn,
+											  const struct bt_gatt_attr *attr,
+											  const void *buf, uint16_t len,
+											  uint16_t offset, uint8_t flags)
+{
+	if (len != 2U)
+	{
+		LOG_ERR("Write sensor data read confirm: Incorrect data length %d, should be %u", len, 2U);
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+	}
+	if (offset != 0)
+	{
+		LOG_ERR("Write sensor data read confirm: Incorrect data offset %d", offset);
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	uint16_t val = sys_get_le16(buf);
+
+	LOG_INF("Central reports %d read bytes.", val);
+
+	sensor_data_chunk_offset += val;
+
+	LOG_INF("Increasing sensor data chunk offset to %u", sensor_data_chunk_offset);
+
+	return len;
+}
+
 static ssize_t write_data_clear_disconnect(struct bt_conn *conn,
 										   const struct bt_gatt_attr *attr,
 										   const void *buf, uint16_t len,
 										   uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Attribute write, handle: %u, conn: %p", attr->handle, (void *)conn);
-
 	if (len != 2U)
 	{
-		LOG_DBG("Write data clear disconnect: Incorrect data length %d", len);
+		LOG_ERR("Write data clear disconnect: Incorrect data length %d, should be %u", len, 2U);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (offset != 0)
 	{
-		LOG_DBG("Write data clear disconnect: Incorrect data offset %d", offset);
+		LOG_ERR("Write data clear disconnect: Incorrect data offset %d", offset);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
 	uint8_t val = sys_get_le16(buf);
 
-	if (val == 0)
-	{
-		LOG_DBG("Write data clear disconnect: Incorrect value %d.", val);
-		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-	}
+	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	if (val != get_sensor_data_length())
 	{
 		LOG_ERR("ERROR\nCentral read incorrect number of sensor data. Sensor data length is %d, central read %d.\nERROR", get_sensor_data_length(), val);
+	}
+	else
+	{
+		// Data can be cleared safely.
+		int err = data_overwrite(FILE_SENSOR_DATA_LOCATION, 0, sizeof(0));
+		if (err < 0)
+		{
+			LOG_ERR("Failed to clear sensor data in flash. Err %d", err);
+		}
 	}
 
 	LOG_DBG("Auto-disconnecting connection %p...", (void *)conn);
@@ -471,6 +642,9 @@ static ssize_t write_data_clear_disconnect(struct bt_conn *conn,
 
 	set_sensor_data_read_in_progress(false);
 
+	LOG_INF("Resetting sensor data chunk offset to 0.");
+	sensor_data_chunk_offset = 0;
+
 	return len;
 }
 
@@ -479,22 +653,22 @@ static ssize_t write_adv_dur_ms(struct bt_conn *conn,
 								const void *buf, uint16_t len,
 								uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Attribute write, handle: %u, conn: %p", attr->handle, (void *)conn);
-
 	if (len != 2U)
 	{
-		LOG_DBG("Write advertising durations: Incorrect data length %d", len);
+		LOG_ERR("Write advertising durations: Incorrect data length %d", len);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (offset != 0)
 	{
-		LOG_DBG("Write advertising durations: Incorrect data offset %d", offset);
+		LOG_ERR("Write advertising durations: Incorrect data offset %d", offset);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
 	uint16_t val = sys_get_le16(buf);
 
 	set_adv_dur_ms(val);
+
+	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -504,22 +678,23 @@ static ssize_t write_adv_int_g_ms(struct bt_conn *conn,
 								  const void *buf, uint16_t len,
 								  uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Attribute write, handle: %u, conn: %p", attr->handle, (void *)conn);
 
 	if (len != 2U)
 	{
-		LOG_DBG("Write advertising interval global: Incorrect data length %d", len);
+		LOG_ERR("Write advertising interval global: Incorrect data length %d", len);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (offset != 0)
 	{
-		LOG_DBG("Write advertising interval global: Incorrect data offset %d", offset);
+		LOG_ERR("Write advertising interval global: Incorrect data offset %d", offset);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
 	uint16_t val = sys_get_le16(buf);
 
 	set_adv_int_g_ms(val);
+
+	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -529,22 +704,23 @@ static ssize_t write_adv_int_l_ms(struct bt_conn *conn,
 								  const void *buf, uint16_t len,
 								  uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Attribute write, handle: %u, conn: %p", attr->handle, (void *)conn);
 
 	if (len != 2U)
 	{
-		LOG_DBG("Write advertising interval local: Incorrect data length %d", len);
+		LOG_ERR("Write advertising interval local: Incorrect data length %d", len);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (offset != 0)
 	{
-		LOG_DBG("Write advertising interval local: Incorrect data offset %d", offset);
+		LOG_ERR("Write advertising interval local: Incorrect data offset %d", offset);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
 	uint16_t val = sys_get_le16(buf);
 
 	set_adv_int_l_ms(val);
+
+	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -554,16 +730,15 @@ static ssize_t write_response_timeout_ms(struct bt_conn *conn,
 										 const void *buf, uint16_t len,
 										 uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Attribute write, handle: %u, conn: %p", attr->handle, (void *)conn);
 
 	if (len != 2U)
 	{
-		LOG_DBG("Write response timeout: Incorrect data length %d", len);
+		LOG_ERR("Write response timeout: Incorrect data length %d", len);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (offset != 0)
 	{
-		LOG_DBG("Write response timeout: Incorrect data offset %d", offset);
+		LOG_ERR("Write response timeout: Incorrect data offset %d", offset);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
@@ -571,11 +746,13 @@ static ssize_t write_response_timeout_ms(struct bt_conn *conn,
 
 	if (val < 0 || val > 1000)
 	{
-		LOG_DBG("Write response timeout: Invalid value %d. Only [0, 1000] allowed.", val);
+		LOG_ERR("Write response timeout: Invalid value %d. Only [0, 1000] allowed.", val);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
 	set_response_timeout_ms(val);
+
+	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -585,16 +762,15 @@ static ssize_t write_transmit_power(struct bt_conn *conn,
 									const void *buf, uint16_t len,
 									uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Attribute write, handle: %u, conn: %p", attr->handle, (void *)conn);
 
 	if (len != 1U)
 	{
-		LOG_DBG("Write transmit power: Incorrect data length %d", len);
+		LOG_ERR("Write transmit power: Incorrect data length %d", len);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (offset != 0)
 	{
-		LOG_DBG("Write transmit power: Incorrect data offset %d", offset);
+		LOG_ERR("Write transmit power: Incorrect data offset %d", offset);
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
@@ -603,30 +779,31 @@ static ssize_t write_transmit_power(struct bt_conn *conn,
 	// TODO: Remove magic numbers here and load from universal config
 	if (val != -3 && val != 0 && val != 3 && val != 6 && val != 9)
 	{
-		LOG_DBG("Write transmit power: Invalid value %d. Only -3, 0, 3, 6, and 9 are allowed.", val);
+		LOG_ERR("Write transmit power: Invalid value %d. Only -3, 0, 3, 6, and 9 are allowed.", val);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
 	set_transmit_power(val);
 
+	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
+
 	return len;
 }
 
-static ssize_t write_sync_unix_time_ms(struct bt_conn *conn,
+static ssize_t write_unix_time_sync_ms(struct bt_conn *conn,
 									   const struct bt_gatt_attr *attr,
 									   const void *buf, uint16_t len,
 									   uint16_t offset, uint8_t flags)
 {
-	LOG_DBG("Attribute write, handle: %u, conn: %p", attr->handle, (void *)conn);
 
 	if (len != 8U)
 	{
-		LOG_DBG("Write sync unix time: Incorrect data length %d", len); // Changed log message
+		LOG_ERR("Write sync unix time: Incorrect data length %d", len); // Changed log message
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	if (offset != 0)
 	{
-		LOG_DBG("Write sync unix time: Incorrect data offset %d", offset); // Changed log message
+		LOG_ERR("Write sync unix time: Incorrect data offset %d", offset); // Changed log message
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
@@ -635,6 +812,12 @@ static ssize_t write_sync_unix_time_ms(struct bt_conn *conn,
 	set_sync_unix_time_ms(val);
 
 	set_uptime_at_sync_ms(k_uptime_get());
+
+	*get_device_initialized_p() = true;
+
+	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %llu", attr->handle, (void *)conn, val);
+
+	LOG_INF("Initialized device by means of synchronizing time with BLE central.");
 
 	return len;
 }
@@ -981,27 +1164,41 @@ uint8_t get_memory_allocation_perc(void)
 
 void set_sensor_data_length(uint32_t length)
 {
-	int ret = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (ret != 0)
+	int err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
+	if (err != 0)
 	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", ret);
+		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", err);
 		return;
 	}
-	g_app_runtime_state.sensor_data_len = length;
+
+	err = data_overwrite(FILE_BT_CHAR_SENSOR_DATA_LENGTH, &length, sizeof(length));
+	if (err < 0)
+	{
+		LOG_ERR("Failed to write sensor data length to flash. Err %d", err);
+	}
+
 	k_mutex_unlock(&g_app_runtime_state_mutex);
 }
 
 uint32_t get_sensor_data_length(void)
 {
-	uint32_t value;
-	int ret = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (ret != 0)
+	uint32_t value = 0;
+
+	int err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
+	if (err != 0)
 	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", ret);
-		return 0;
+		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", err);
+		return value;
 	}
-	value = g_app_runtime_state.sensor_data_len;
+
+	err = data_read(FILE_BT_CHAR_SENSOR_DATA_LENGTH, &value, 0, sizeof(value));
+	if (err < 0)
+	{
+		LOG_ERR("Failed to read sensor data length from flash. Err %d", err);
+	}
+
 	k_mutex_unlock(&g_app_runtime_state_mutex);
+
 	return value;
 }
 
@@ -1091,4 +1288,27 @@ bool get_sensor_data_read_in_progress(void)
 	k_mutex_unlock(&sensor_data_read_in_progress_mutex);
 
 	return val;
+}
+
+int register_device_initialized_p(bool *device_initialized)
+{
+	if (device_initialized == NULL)
+	{
+		LOG_ERR("Failed to register device initialized pointer. Pointer is NULL.");
+		return -1;
+	}
+	device_initialized_p = device_initialized;
+
+	return 0;
+}
+
+bool *get_device_initialized_p(void)
+{
+	if (device_initialized_p == NULL)
+	{
+		LOG_ERR("Failed to get device initialized pointer. Pointer is NULL.");
+		return NULL;
+	}
+
+	return device_initialized_p;
 }
