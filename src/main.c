@@ -542,7 +542,7 @@ typedef struct
 } sensor_data_t;
 
 static sensor_data_t sensor_data_buffer[(2 * SENSOR_DATA_BUFFER_SIZE_MAX)]; // 2x for storing values during BLE transfer.
-static K_MUTEX_DEFINE(sensor_data_buffer_mutex);
+static K_MUTEX_DEFINE(sensor_data_flash_mutex);
 
 static ssize_t sensor_data_buffer_size = 0;
 static int64_t previous_sync_unix_time_ms = 0;
@@ -550,7 +550,7 @@ static uint32_t previous_sensor_data_time = 0;
 
 bool sensor_data_buffer_clear();
 
-sensor_data_t sensor_data;
+sensor_data_t app_sensor_data;
 
 sensor_data_t *sensor_data_generate()
 {
@@ -558,9 +558,9 @@ sensor_data_t *sensor_data_generate()
 
 	uint8_t data_length = sys_rand8_get() % 100 + 1;
 
-	if (sensor_data.raw_data != NULL)
+	if (app_sensor_data.raw_data != NULL)
 	{
-		free(sensor_data.raw_data);
+		free(app_sensor_data.raw_data);
 	}
 
 	uint8_t *raw_data = (uint8_t *)malloc(data_length * sizeof(uint8_t));
@@ -575,62 +575,66 @@ sensor_data_t *sensor_data_generate()
 		*(raw_data + i) = sys_rand8_get();
 	}
 
-	sensor_data.time_delta = k_uptime_get();
-	sensor_data.data_length = data_length;
-	sensor_data.raw_data = raw_data;
+	app_sensor_data.time_delta = k_uptime_get();
+	app_sensor_data.data_length = data_length;
+	app_sensor_data.raw_data = raw_data;
 
-	LOG_INF("Generated sensor data sample of %d elements at time %d.", sensor_data.data_length, sensor_data.time_delta);
+	LOG_INF("Generated sensor data sample of %d elements at time %d.", app_sensor_data.data_length, app_sensor_data.time_delta);
 
-	return &sensor_data;
+	return &app_sensor_data;
 }
 
 uint32_t log_total_data_length_in_flash = 0;
 
-#define HEX_CHUNK_BUFFER_SIZE_BYTES 16 // How many raw bytes to process in one hex formatting chunk
+#define HEX_CHUNK_BUFFER_SIZE_BYTES 16								// How many raw bytes to process in one hex formatting chunk
 #define HEX_OUTPUT_STRING_LEN (HEX_CHUNK_BUFFER_SIZE_BYTES * 3 + 1) // (16*2 for hex chars) + (16-1 for spaces) + 1 for null terminator = 32 + 15 + 1 = 48
 
 // Helper function to print a specific buffer in hex
 void print_buffer_hex(const uint8_t *buffer, size_t length)
 {
-    // Use a local static buffer to avoid stack overflow for large lengths,
-    // and to persist between calls if needed (though not strictly necessary here).
-    // The buffer size is chosen to be reasonable for a single printk call.
-    char hex_string_buffer[HEX_OUTPUT_STRING_LEN];
-    int hex_string_idx;
+	// Use a local static buffer to avoid stack overflow for large lengths,
+	// and to persist between calls if needed (though not strictly necessary here).
+	// The buffer size is chosen to be reasonable for a single printk call.
+	char hex_string_buffer[HEX_OUTPUT_STRING_LEN];
+	int hex_string_idx;
 
-    size_t current_offset = 0;
+	size_t current_offset = 0;
 
-    while (current_offset < length) {
-        // Determine how many raw bytes to process in this chunk
-        size_t bytes_to_process = length - current_offset;
-        if (bytes_to_process > HEX_CHUNK_BUFFER_SIZE_BYTES) {
-            bytes_to_process = HEX_CHUNK_BUFFER_SIZE_BYTES;
-        }
+	while (current_offset < length)
+	{
+		// Determine how many raw bytes to process in this chunk
+		size_t bytes_to_process = length - current_offset;
+		if (bytes_to_process > HEX_CHUNK_BUFFER_SIZE_BYTES)
+		{
+			bytes_to_process = HEX_CHUNK_BUFFER_SIZE_BYTES;
+		}
 
-        hex_string_idx = 0; // Reset index for the new hex string chunk
+		hex_string_idx = 0; // Reset index for the new hex string chunk
 
-        // Format the raw bytes into a hexadecimal string
-        for (size_t k = 0; k < bytes_to_process; k++) {
-            // Convert byte to two hex characters
-            // Use static const char for hex_digits to avoid re-initialization
-            static const char hex_digits[] = "0123456789abcdef";
-            hex_string_buffer[hex_string_idx++] = hex_digits[(buffer[current_offset + k] >> 4) & 0xF];
-            hex_string_buffer[hex_string_idx++] = hex_digits[buffer[current_offset + k] & 0xF];
+		// Format the raw bytes into a hexadecimal string
+		for (size_t k = 0; k < bytes_to_process; k++)
+		{
+			// Convert byte to two hex characters
+			// Use static const char for hex_digits to avoid re-initialization
+			static const char hex_digits[] = "0123456789abcdef";
+			hex_string_buffer[hex_string_idx++] = hex_digits[(buffer[current_offset + k] >> 4) & 0xF];
+			hex_string_buffer[hex_string_idx++] = hex_digits[buffer[current_offset + k] & 0xF];
 
-            // Add a space between hex values for readability, except after the last byte of the chunk
-            if (k < bytes_to_process - 1) {
-                hex_string_buffer[hex_string_idx++] = ' ';
-            }
-        }
-        // Null-terminate the formatted hex string
-        hex_string_buffer[hex_string_idx] = '\0';
+			// Add a space between hex values for readability, except after the last byte of the chunk
+			if (k < bytes_to_process - 1)
+			{
+				hex_string_buffer[hex_string_idx++] = ' ';
+			}
+		}
+		// Null-terminate the formatted hex string
+		hex_string_buffer[hex_string_idx] = '\0';
 
-        // Print the entire formatted string with a single printk call
-        printk("%s", hex_string_buffer); // Add newline after each chunk
+		// Print the entire formatted string with a single printk call
+		printk("%s", hex_string_buffer); // Add newline after each chunk
 
-        // Advance the offset
-        current_offset += bytes_to_process;
-    }
+		// Advance the offset
+		current_offset += bytes_to_process;
+	}
 }
 
 sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
@@ -681,97 +685,128 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 
 	previous_sensor_data_time = current_uptime;
 
-	err = k_mutex_lock(&sensor_data_buffer_mutex, K_FOREVER);
-	if (err < 0)
+	bool sensor_data_flash_mutex_locked = false;
+
+	LOG_ERR("Locking sensor_data_flash_mutex");
+
+	err = k_mutex_lock(&sensor_data_flash_mutex, K_NO_WAIT); // Don't wait
+	if (err != 0)
 	{
-		LOG_ERR("Failed to lock sensor data buffer mutex. Error %d", err);
-		return NULL;
+		LOG_ERR("Failed to lock sensor data buffer mutex. Error %d. BLE transfer probably in motion. ", err);
 	}
+	else
+	{
+		sensor_data_flash_mutex_locked = true;
+		
+		if (sensor_data_buffer_size >= SENSOR_DATA_BUFFER_SIZE_MAX && !get_sensor_data_read_in_progress())
+		{ // Store to flash and reset
+			sensor_data_flash_mutex_locked = true;
 
-	if (sensor_data_buffer_size >= SENSOR_DATA_BUFFER_SIZE_MAX && !get_sensor_data_read_in_progress())
-	{ // Store to flash and reset
+			// FIXME: What if the bluetooth transfer happens HERE?
 
-		LOG_INF("Sensor data buffer filled. Transfer to flash initiated.");
+			LOG_INF("Sensor data buffer filled. Transfer to flash initiated.");
 
-		uint64_t total_data_size_bytes = sensor_data_buffer_size * (sizeof(uint32_t) + sizeof(uint8_t));
+			uint64_t total_data_size_bytes = sensor_data_buffer_size * (sizeof(sensor_data->time_delta) + sizeof(sensor_data->data_length));
 
-		for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
-		{
-			total_data_size_bytes += sensor_data_buffer[i].data_length;
-		}
-
-		if (total_data_size_bytes == 0)
-		{
-			LOG_ERR("Total sensor buffer data size in bytes is 0.");
-			k_mutex_unlock(&sensor_data_buffer_mutex);
-			return NULL;
-		}
-
-		uint8_t *data_p = (uint8_t *)malloc(total_data_size_bytes * sizeof(uint8_t));
-		if (data_p == NULL)
-		{
-			LOG_ERR("Failed to allocate memory for sensor data buffer transfer into flash.");
-			k_mutex_unlock(&sensor_data_buffer_mutex);
-			return NULL;
-		}
-
-		uint64_t ptr_offset = 0;
-
-		for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
-		{
-			for (uint8_t j = 0; j < 4; j++)
+			for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
 			{
-				*(data_p + ptr_offset++) = (sensor_data_buffer[i].time_delta >> (j * 8)) && 0xFF;
+				total_data_size_bytes += sensor_data_buffer[i].data_length;
 			}
 
-			*(data_p + ptr_offset++) = sensor_data_buffer[i].data_length;
-
-			for (uint8_t j = 0; j < sensor_data_buffer[i].data_length; j++)
+			if (total_data_size_bytes == 0)
 			{
-				*(data_p + ptr_offset++) = *(sensor_data_buffer[i].raw_data + j);
+				LOG_ERR("Total sensor buffer data size in bytes is 0.");
+				LOG_ERR("Unlocking sensor_data_flash_mutex");
+
+				k_mutex_unlock(&sensor_data_flash_mutex);
+				return NULL;
 			}
 
-			free(sensor_data_buffer[i].raw_data);
-			sensor_data_buffer[i].raw_data = NULL;
-		}
+			uint8_t *data_p = (uint8_t *)malloc(total_data_size_bytes * sizeof(uint8_t));
+			if (data_p == NULL)
+			{
+				LOG_ERR("Failed to allocate memory for sensor data buffer transfer into flash.");
+				LOG_ERR("Unlocking sensor_data_flash_mutex");
+				k_mutex_unlock(&sensor_data_flash_mutex);
+				return NULL;
+			}
 
-		if (ptr_offset != total_data_size_bytes)
-		{
-			LOG_ERR("Total sensor data length in bytes is not equal to pointer offset. Error.");
-			k_mutex_unlock(&sensor_data_buffer_mutex);
+			uint64_t ptr_offset = 0;
+
+			LOG_DBG("Starting pointer arithmetic.");
+
+			for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
+			{
+				for (uint8_t j = 0; j < sizeof(sensor_data->time_delta); j++) // TODO: Remove hardcode
+				{
+					*(data_p + ptr_offset++) = (sensor_data_buffer[i].time_delta >> (j * 8)) && 0xFF;
+				}
+
+				*(data_p + ptr_offset++) = sensor_data_buffer[i].data_length;
+
+				// TODO: Works only if the data type is of type uint8_t
+				for (uint8_t j = 0; j < sensor_data_buffer[i].data_length; j++)
+				{
+					*(data_p + ptr_offset++) = *(sensor_data_buffer[i].raw_data + j);
+				}
+
+				free(sensor_data_buffer[i].raw_data);
+				sensor_data_buffer[i].raw_data = NULL;
+			}
+
+			LOG_DBG("Ending pointer arithmetic.");
+
+			if (ptr_offset != total_data_size_bytes)
+			{
+				LOG_ERR("Total sensor data length in bytes is not equal to pointer offset.");
+				LOG_ERR("Unlocking sensor_data_flash_mutex");
+
+				k_mutex_unlock(&sensor_data_flash_mutex);
+				free(data_p);
+				return NULL;
+			}
+
+			err = data_append(FILE_SENSOR_DATA_LOCATION, data_p, total_data_size_bytes);
+			if (err < 0)
+			{
+				LOG_ERR("Failed to append sensor data to flash: %d", err);
+				LOG_ERR("Unlocking sensor_data_flash_mutex");
+
+				k_mutex_unlock(&sensor_data_flash_mutex);
+				free(data_p);
+				return NULL;
+			}
+
+			set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
+			log_total_data_length_in_flash += sensor_data_buffer_size;
+
+			sensor_data_buffer_clear();
+			sensor_data_buffer_size = 0;
+
+			// print_buffer_hex(data_p, total_data_size_bytes);
+
+			LOG_DBG("Freeing data_p pointer");
+
 			free(data_p);
-			return NULL;
+
+			// print_zephyr_fs_details();
 		}
-
-		err = data_append(FILE_SENSOR_DATA_LOCATION, data_p, total_data_size_bytes);
-		if (err < 0)
-		{
-			LOG_ERR("Failed to append sensor data to flash: %d", err);
-			k_mutex_unlock(&sensor_data_buffer_mutex);
-			free(data_p);
-			return NULL;
-		}
-
-		set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
-		log_total_data_length_in_flash += sensor_data_buffer_size;
-
-		sensor_data_buffer_clear();
-		sensor_data_buffer_size = 0;
-
-		//print_buffer_hex(data_p, total_data_size_bytes);
-
-		free(data_p);
-
-		//print_zephyr_fs_details();
 	}
+
+	// TODO: Add sensor data mutex
 
 	sensor_data_buffer[sensor_data_buffer_size++] = *sensor_data;
+
+	if (sensor_data_flash_mutex_locked)
+	{
+		LOG_ERR("Unlocking sensor_data_flash_mutex");
+
+		k_mutex_unlock(&sensor_data_flash_mutex);
+	}
 
 	LOG_INF("Sensor data info: timestamp[ms]: %d, data length: %d", sensor_data->time_delta, sensor_data->data_length);
 
 	LOG_INF("Added sensor data element to sensor data buffer. Sensor data buffer's length is now %d. Total sensor data length in flash is %d", sensor_data_buffer_size, log_total_data_length_in_flash);
-
-	k_mutex_unlock(&sensor_data_buffer_mutex);
 
 	return &sensor_data_buffer[sensor_data_buffer_size - 1];
 }
@@ -797,7 +832,7 @@ bool sensor_data_buffer_element_remove(size_t index)
 
 	// FIXME: Circular buffer please.
 
-	int err = k_mutex_lock(&sensor_data_buffer_mutex, K_FOREVER);
+	int err = k_mutex_lock(&sensor_data_flash_mutex, K_FOREVER);
 
 	if (err < 0)
 	{
@@ -809,7 +844,7 @@ bool sensor_data_buffer_element_remove(size_t index)
 
 	sensor_data_buffer[index].raw_data = NULL;
 
-	k_mutex_unlock(&sensor_data_buffer_mutex);
+	k_mutex_unlock(&sensor_data_flash_mutex);
 
 	sensor_data_buffer_size--;
 
@@ -825,7 +860,7 @@ bool sensor_data_buffer_clear()
 		return true;
 	}
 
-	int err = k_mutex_lock(&sensor_data_buffer_mutex, K_FOREVER);
+	int err = k_mutex_lock(&sensor_data_flash_mutex, K_FOREVER);
 
 	if (err < 0)
 	{
@@ -839,7 +874,7 @@ bool sensor_data_buffer_clear()
 		sensor_data_buffer[i].raw_data = NULL;
 	}
 
-	k_mutex_unlock(&sensor_data_buffer_mutex);
+	k_mutex_unlock(&sensor_data_flash_mutex);
 
 	sensor_data_buffer_size = 0;
 
@@ -1099,6 +1134,8 @@ int init_all()
 	k_work_schedule(&work_blink, K_NO_WAIT);
 
 	k_work_init_delayable(&work_sensor_data_gen_delayable, work_sensor_data_gen_delayable_handler);
+
+	set_sensor_data_mutex(&sensor_data_flash_mutex);
 
 	err = register_device_initialized_p(&app_adv_mfg_data.device_initialized);
 	if (err < 0)

@@ -61,6 +61,8 @@ static K_MUTEX_DEFINE(sensor_data_read_in_progress_mutex);
 static bool sensor_data_read_in_progress = false;
 static uint32_t sensor_data_chunk_offset = 0;
 
+static struct k_mutex *sensor_data_flash_mutex;
+
 static bool *device_initialized_p;
 
 typedef struct
@@ -480,17 +482,29 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 								uint16_t len, uint16_t offset)
 {
 
-	set_sensor_data_read_in_progress(true);
+	if (get_sensor_data_read_in_progress() == false) // This is the only place where we set the value to true, so unprotected access is ok.
+	{
+		LOG_ERR("Attempting to lock sensor_data_flash_mutex.");
+		int mutex_err = k_mutex_lock(sensor_data_flash_mutex, K_FOREVER);
+		if (mutex_err != 0)
+		{
+			LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", mutex_err);
+			set_sensor_data_read_in_progress(false);
+			return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+		}
+
+		LOG_ERR("Locked sensor_data_flash_mutex");
+
+		set_sensor_data_read_in_progress(true);
+
+		LOG_INF("Sensor data read in progress set to true");
+
+		k_mutex_unlock(sensor_data_flash_mutex); // FIXME: What about this mutex here?
+
+		LOG_ERR("Unlocked sensor_data_flash_mutex");
+	}
 
 	LOG_DBG("BT conn MTU during data transfer is: %d", bt_gatt_get_mtu(conn));
-
-	int mutex_err = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (mutex_err != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", mutex_err);
-		set_sensor_data_read_in_progress(false);
-		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
-	}
 
 	// TODO: Add check
 	ssize_t bytes_read = data_read(FILE_SENSOR_DATA_LOCATION, buf, sensor_data_chunk_offset, BT_LONG_TRANSFER_SIZE_BYTES_MAX);
@@ -498,11 +512,8 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 	{
 		LOG_ERR("Failed to read sensor data from flash %d", bytes_read);
 		set_sensor_data_read_in_progress(false);
-		k_mutex_unlock(&g_app_runtime_state_mutex);
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 	}
-
-	k_mutex_unlock(&g_app_runtime_state_mutex);
 
 	LOG_DBG("Attribute read, handle: %u, conn: %p, offset: %d, requested length: %d, total read: %d", attr->handle, (void *)conn, offset, len, bytes_read);
 
@@ -641,6 +652,8 @@ static ssize_t write_data_clear_disconnect(struct bt_conn *conn,
 	k_work_submit(&m_disconnect_work.work);
 
 	set_sensor_data_read_in_progress(false);
+
+	LOG_INF("Sensor data read in progress set to false");
 
 	LOG_INF("Resetting sensor data chunk offset to 0.");
 	sensor_data_chunk_offset = 0;
@@ -1311,4 +1324,9 @@ bool *get_device_initialized_p(void)
 	}
 
 	return device_initialized_p;
+}
+
+void set_sensor_data_mutex(struct k_mutex *s_data_mutex)
+{
+	sensor_data_flash_mutex = s_data_mutex;
 }

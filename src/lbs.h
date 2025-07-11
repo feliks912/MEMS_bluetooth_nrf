@@ -101,7 +101,11 @@ bool get_sensor_data_read_in_progress(void);
 void set_sensor_data_read_in_progress(bool state);
 uint16_t get_adv_dur_ms(void);
 uint16_t get_adv_int_g_ms(void);
+
 int register_device_initialized_p(bool *device_initialized);
+
+void set_sensor_data_mutex(struct k_mutex *s_data_mutex);
+
 
 #ifdef __cplusplus
 }
