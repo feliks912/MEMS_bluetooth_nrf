@@ -9,7 +9,7 @@
 
 #define FS_ROOT "/lfs1"
 
-LOG_MODULE_REGISTER(flash_logger, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(flash_logger, LOG_LEVEL_ERR);
 
 const int create_directory(const char *full_path)
 {
@@ -174,7 +174,7 @@ int print_zephyr_fs_details(void) {
     struct fs_statvfs s_buf; // Declare the statvfs buffer
     int rc;
 
-    LOG_INF("Attempting to get filesystem statistics for path: %s", FS_ROOT);
+    LOG_DBG("Attempting to get filesystem statistics for path: %s", FS_ROOT);
 
     // Call fs_statvfs to get the filesystem information
     rc = fs_statvfs(FS_ROOT, &s_buf);

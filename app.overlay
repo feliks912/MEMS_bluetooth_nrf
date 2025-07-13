@@ -1,6 +1,10 @@
 / {
     chosen {
         zephyr,littlefs = &storage_partition;
-        //zephyr,settings = &storage_partition;
     };
-};  
+};
+
+
+&uart20 {
+    current-speed = <1000000>;
+};

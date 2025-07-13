@@ -29,7 +29,7 @@
 
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(bt_logger, LOG_LEVEL_DBG);
+LOG_MODULE_REGISTER(bt_logger, LOG_LEVEL_INF);
 
 #ifndef DEVICE_NAME
 #define DEVICE_NAME CONFIG_BT_DEVICE_NAME
@@ -81,9 +81,7 @@ typedef struct
 {
 	uint8_t battery_level;
 	uint8_t memory_allocation_perc;
-	uint8_t log_data[LOG_BUFFER_SIZE];
 	uint16_t device_log_len;
-	uint8_t sensor_data[BT_LONG_TRANSFER_SIZE_BYTES_MAX];
 	uint16_t sensor_data_len;
 } app_runtime_state_t;
 
@@ -167,12 +165,19 @@ static void disconnect_work_handler(struct k_work *work)
 	// If you used a custom struct like 'disconnect_work'
 	struct disconnect_work *disconnect_w = CONTAINER_OF(work, struct disconnect_work, work);
 	LOG_INF("Disconnecting connection %p from work queue.", (void *)disconnect_w->conn);
-	int err = bt_conn_disconnect(disconnect_w->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-	if (err)
+	if (disconnect_w->conn != NULL)
 	{
-		LOG_ERR("Failed to disconnect (err %d)", err);
+		int err = bt_conn_disconnect(disconnect_w->conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		if (err)
+		{
+			LOG_ERR("Failed to disconnect (err %d)", err);
+		}
+		bt_conn_unref(disconnect_w->conn);	
 	}
-	bt_conn_unref(disconnect_w->conn);
+	else
+	{
+		LOG_INF("bluetooth conn is null.");
+	}
 }
 
 int char_init_values(void)
@@ -180,7 +185,7 @@ int char_init_values(void)
 	int err;
 	int ret = 0;
 
-	LOG_INF("Starting characteristing initalization function.");
+	LOG_DBG("Starting characteristing initalization function.");
 
 	int8_t transmit_power;
 	uint16_t response_timeout_ms;
@@ -372,7 +377,7 @@ int char_init_values(void)
 		LOG_ERR("Failed to read or create device log file. Err %d", err);
 	}
 
-	LOG_INF("Ending characteristing initalization function.");
+	LOG_DBG("Ending characteristing initalization function.");
 
 	return ret;
 }
@@ -415,7 +420,7 @@ static ssize_t read_battery_level(struct bt_conn *conn, const struct bt_gatt_att
 {
 	uint8_t battery_level = get_battery_level();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Battery Level: %u", attr->handle, (void *)conn, battery_level);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Battery Level: %u", attr->handle, (void *)conn, battery_level);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &battery_level, sizeof(battery_level));
 }
@@ -425,7 +430,7 @@ static ssize_t read_memory_aloc_perc(struct bt_conn *conn, const struct bt_gatt_
 {
 	uint8_t perc = get_memory_allocation_perc();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Mem Alloc Perc: %u", attr->handle, (void *)conn, perc);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Mem Alloc Perc: %u", attr->handle, (void *)conn, perc);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &perc, sizeof(perc));
 }
@@ -444,10 +449,10 @@ static ssize_t read_device_log(struct bt_conn *conn, const struct bt_gatt_attr *
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 	}
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p", attr->handle, (void *)conn);
+	LOG_INF("Attribute read, handle: %u, conn: %p", attr->handle, (void *)conn);
 
 	// Access protected data
-	log_data = g_app_runtime_state.log_data;
+	log_data = NULL;
 	log_data_len = g_app_runtime_state.device_log_len;
 
 	if (offset >= log_data_len)
@@ -472,19 +477,20 @@ static ssize_t read_device_log_length(struct bt_conn *conn, const struct bt_gatt
 {
 	uint16_t length_val = get_device_log_len();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Device Log Len: %u", attr->handle, (void *)conn, length_val);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Device Log Len: %u", attr->handle, (void *)conn, length_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &length_val, sizeof(length_val));
 }
 
-// TODO: Sync this to a sensor data setter?
+uint16_t mtu_truncated = BT_LONG_TRANSFER_SIZE_BYTES_MAX;
+
 static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf,
 								uint16_t len, uint16_t offset)
 {
 
 	if (get_sensor_data_read_in_progress() == false) // This is the only place where we set the value to true, so unprotected access is ok.
 	{
-		LOG_ERR("Attempting to lock sensor_data_flash_mutex.");
+		LOG_INF("Attempting to lock sensor_data_flash_mutex.");
 		int mutex_err = k_mutex_lock(sensor_data_flash_mutex, K_FOREVER);
 		if (mutex_err != 0)
 		{
@@ -493,21 +499,34 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 			return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 		}
 
-		LOG_ERR("Locked sensor_data_flash_mutex");
+		LOG_DBG("Locked sensor_data_flash_mutex");
 
 		set_sensor_data_read_in_progress(true);
 
-		LOG_INF("Sensor data read in progress set to true");
+		LOG_DBG("Sensor data read in progress set to true");
 
 		k_mutex_unlock(sensor_data_flash_mutex); // FIXME: What about this mutex here?
 
-		LOG_ERR("Unlocked sensor_data_flash_mutex");
+		LOG_DBG("Unlocked sensor_data_flash_mutex");
+
+		uint16_t mtu_size = bt_gatt_get_mtu(conn);
+
+		mtu_truncated = mtu_size;
+
+		if (mtu_size >= 100)
+		{
+			mtu_truncated = (mtu_size / 100) * 100;
+		}
+		else if (mtu_size >= 10)
+		{
+			mtu_truncated = (mtu_size / 10) * 10;
+		}
+
+		LOG_DBG("BT conn MTU during data transfer is: %d. Truncating to %d", mtu_size, mtu_truncated);
 	}
 
-	LOG_DBG("BT conn MTU during data transfer is: %d", bt_gatt_get_mtu(conn));
-
 	// TODO: Add check
-	ssize_t bytes_read = data_read(FILE_SENSOR_DATA_LOCATION, buf, sensor_data_chunk_offset, BT_LONG_TRANSFER_SIZE_BYTES_MAX);
+	ssize_t bytes_read = data_read(FILE_SENSOR_DATA_LOCATION, buf, sensor_data_chunk_offset, MIN(mtu_truncated, BT_LONG_TRANSFER_SIZE_BYTES_MAX));
 	if (bytes_read < 0)
 	{
 		LOG_ERR("Failed to read sensor data from flash %d", bytes_read);
@@ -515,7 +534,7 @@ static ssize_t read_sensor_data(struct bt_conn *conn, const struct bt_gatt_attr 
 		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
 	}
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, offset: %d, requested length: %d, total read: %d", attr->handle, (void *)conn, offset, len, bytes_read);
+	LOG_INF("Attribute read, handle: %u, conn: %p, offset: %d, requested length: %d, total read: %d", attr->handle, (void *)conn, offset, len, bytes_read);
 
 	return bytes_read;
 }
@@ -525,7 +544,7 @@ static ssize_t read_sensor_data_length(struct bt_conn *conn, const struct bt_gat
 {
 	uint32_t length_val = get_sensor_data_length();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Sensor Data Len: %u", attr->handle, (void *)conn, length_val);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Sensor Data Len: %u", attr->handle, (void *)conn, length_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &length_val, sizeof(length_val));
 }
@@ -535,7 +554,7 @@ static ssize_t read_adv_dur_ms(struct bt_conn *conn, const struct bt_gatt_attr *
 {
 	uint16_t duration_val = get_adv_dur_ms();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Adv Dur: %u", attr->handle, (void *)conn, duration_val);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Adv Dur: %u", attr->handle, (void *)conn, duration_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &duration_val, sizeof(duration_val));
 }
@@ -545,7 +564,7 @@ static ssize_t read_adv_int_g_ms(struct bt_conn *conn, const struct bt_gatt_attr
 {
 	uint16_t interval_val = get_adv_int_g_ms();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Adv Int Global: %u", attr->handle, (void *)conn, interval_val);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Adv Int Global: %u", attr->handle, (void *)conn, interval_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &interval_val, sizeof(interval_val));
 }
@@ -555,7 +574,7 @@ static ssize_t read_adv_int_l_ms(struct bt_conn *conn, const struct bt_gatt_attr
 {
 	uint16_t interval_val = get_adv_int_l_ms();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Adv Int Local: %u", attr->handle, (void *)conn, interval_val);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Adv Int Local: %u", attr->handle, (void *)conn, interval_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &interval_val, sizeof(interval_val));
 }
@@ -565,7 +584,7 @@ static ssize_t read_response_timeout_ms(struct bt_conn *conn, const struct bt_ga
 {
 	uint16_t timeout_val = get_response_timeout_ms();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Response Timeout: %u", attr->handle, (void *)conn, timeout_val);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Response Timeout: %u", attr->handle, (void *)conn, timeout_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &timeout_val, sizeof(timeout_val));
 }
@@ -575,7 +594,7 @@ static ssize_t read_transmit_power(struct bt_conn *conn, const struct bt_gatt_at
 {
 	int8_t power_val = get_transmit_power_level();
 
-	LOG_DBG("Attribute read, handle: %u, conn: %p, Transmit Power: %d", attr->handle, (void *)conn, power_val);
+	LOG_INF("Attribute read, handle: %u, conn: %p, Transmit Power: %d", attr->handle, (void *)conn, power_val);
 
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, &power_val, sizeof(power_val));
 }
@@ -600,11 +619,14 @@ static ssize_t write_sensor_data_read_confirm(struct bt_conn *conn,
 
 	uint16_t val = sys_get_le16(buf);
 
-	LOG_INF("Central reports %d read bytes.", val);
+	LOG_DBG("Central reports %d read bytes.", val);
+
+	// TODO: add chunk re-reading if it's incorrectly read, although that would terminate the connection from the endpoint of the central.
+	// FIXME: That's very bad. We're basically relying on the connection quality to not lose all data. Should add a check.
 
 	sensor_data_chunk_offset += val;
 
-	LOG_INF("Increasing sensor data chunk offset to %u", sensor_data_chunk_offset);
+	LOG_DBG("Increasing sensor data chunk offset to %u", sensor_data_chunk_offset);
 
 	return len;
 }
@@ -625,15 +647,15 @@ static ssize_t write_data_clear_disconnect(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
-	uint8_t val = sys_get_le16(buf);
+	uint16_t val = sys_get_le16(buf);
 
-	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
+	LOG_INF("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	if (val != get_sensor_data_length())
 	{
-		LOG_ERR("ERROR\nCentral read incorrect number of sensor data. Sensor data length is %d, central read %d.\nERROR", get_sensor_data_length(), val);
+		LOG_ERR("Central read incorrect number of sensor data. Sensor data length is %d, central read %d.", get_sensor_data_length(), val);
 	}
-	else
+	/* else
 	{
 		// Data can be cleared safely.
 		int err = data_overwrite(FILE_SENSOR_DATA_LOCATION, 0, sizeof(0));
@@ -641,21 +663,27 @@ static ssize_t write_data_clear_disconnect(struct bt_conn *conn,
 		{
 			LOG_ERR("Failed to clear sensor data in flash. Err %d", err);
 		}
-	}
+	} */
 
 	LOG_DBG("Auto-disconnecting connection %p...", (void *)conn);
 
-	k_work_init(&m_disconnect_work.work, disconnect_work_handler);
+	if (!k_work_is_pending(&m_disconnect_work.work))
+	{
+		k_work_init(&m_disconnect_work.work, disconnect_work_handler);
+	}
 
-	m_disconnect_work.conn = bt_conn_ref(conn); // Increment reference count
+	if (conn != NULL)
+	{
+		m_disconnect_work.conn = bt_conn_ref(conn); // Increment reference count
 
-	k_work_submit(&m_disconnect_work.work);
+		k_work_submit(&m_disconnect_work.work);
+	}
 
 	set_sensor_data_read_in_progress(false);
 
-	LOG_INF("Sensor data read in progress set to false");
+	LOG_DBG("Sensor data read in progress set to false");
 
-	LOG_INF("Resetting sensor data chunk offset to 0.");
+	LOG_DBG("Resetting sensor data chunk offset to 0.");
 	sensor_data_chunk_offset = 0;
 
 	return len;
@@ -681,7 +709,7 @@ static ssize_t write_adv_dur_ms(struct bt_conn *conn,
 
 	set_adv_dur_ms(val);
 
-	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
+	LOG_INF("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -707,7 +735,7 @@ static ssize_t write_adv_int_g_ms(struct bt_conn *conn,
 
 	set_adv_int_g_ms(val);
 
-	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
+	LOG_INF("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -733,7 +761,7 @@ static ssize_t write_adv_int_l_ms(struct bt_conn *conn,
 
 	set_adv_int_l_ms(val);
 
-	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
+	LOG_INF("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -765,7 +793,7 @@ static ssize_t write_response_timeout_ms(struct bt_conn *conn,
 
 	set_response_timeout_ms(val);
 
-	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
+	LOG_INF("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -798,7 +826,7 @@ static ssize_t write_transmit_power(struct bt_conn *conn,
 
 	set_transmit_power(val);
 
-	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
+	LOG_INF("Attribute write, handle: %u, conn: %p, value: %d", attr->handle, (void *)conn, val);
 
 	return len;
 }
@@ -828,7 +856,7 @@ static ssize_t write_unix_time_sync_ms(struct bt_conn *conn,
 
 	*get_device_initialized_p() = true;
 
-	LOG_DBG("Attribute write, handle: %u, conn: %p, value: %llu", attr->handle, (void *)conn, val);
+	LOG_INF("Attribute write, handle: %u, conn: %p, value: %llu", attr->handle, (void *)conn, val);
 
 	LOG_INF("Initialized device by means of synchronizing time with BLE central.");
 
@@ -1098,43 +1126,6 @@ uint8_t get_battery_level(void)
 	return value;
 }
 
-// TODO: replace set and get device log from flash directly.
-void set_device_log(const uint8_t *log_data, uint16_t len)
-{
-	int ret = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (ret != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", ret);
-		return;
-	}
-	uint16_t bytes_to_copy = (len < LOG_BUFFER_SIZE) ? len : LOG_BUFFER_SIZE;
-	memcpy(g_app_runtime_state.log_data, log_data, bytes_to_copy);
-	g_app_runtime_state.device_log_len = bytes_to_copy;
-	k_mutex_unlock(&g_app_runtime_state_mutex);
-}
-
-const uint8_t *get_device_log(uint16_t *len_out)
-{
-	// Similar considerations as get_device_name for returning pointer to shared data.
-	// If `len_out` is passed, it's also updated under mutex protection.
-	const uint8_t *value;
-	int ret = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (ret != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", ret);
-		if (len_out != NULL)
-			*len_out = 0; // Indicate no data
-		return NULL;
-	}
-	if (len_out != NULL)
-	{
-		*len_out = g_app_runtime_state.device_log_len;
-	}
-	value = g_app_runtime_state.log_data;
-	k_mutex_unlock(&g_app_runtime_state_mutex);
-	return value;
-}
-
 uint16_t get_device_log_len(void)
 {
 	uint16_t value;
@@ -1217,40 +1208,6 @@ uint32_t get_sensor_data_length(void)
 
 // ------- RUNTIME VARIABLES GETTERS AND SETTERS --------
 
-void set_sensor_data(const uint8_t *data, uint16_t len)
-{
-	int ret = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (ret != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", ret);
-		return;
-	}
-	uint16_t bytes_to_copy = (len < SENSOR_DATA_BUFFER_SIZE) ? len : SENSOR_DATA_BUFFER_SIZE;
-	memcpy(g_app_runtime_state.sensor_data, data, bytes_to_copy);
-	g_app_runtime_state.sensor_data_len = bytes_to_copy;
-	k_mutex_unlock(&g_app_runtime_state_mutex);
-}
-
-const uint8_t *get_sensor_data(uint16_t *len_out)
-{
-	const uint8_t *value;
-	int ret = k_mutex_lock(&g_app_runtime_state_mutex, K_FOREVER);
-	if (ret != 0)
-	{
-		LOG_ERR("Failed to lock g_app_runtime_state_mutex: %d", ret);
-		if (len_out != NULL)
-			*len_out = 0;
-		return NULL;
-	}
-	if (len_out != NULL)
-	{
-		*len_out = g_app_runtime_state.sensor_data_len;
-	}
-	value = g_app_runtime_state.sensor_data;
-	k_mutex_unlock(&g_app_runtime_state_mutex);
-	return value;
-}
-
 void set_uptime_at_sync_ms(uint64_t uptime)
 {
 	int mutex_err = k_mutex_lock(&uptime_at_sync_ms_mutex, K_FOREVER);
@@ -1326,7 +1283,7 @@ bool *get_device_initialized_p(void)
 	return device_initialized_p;
 }
 
-void set_sensor_data_mutex(struct k_mutex *s_data_mutex)
+void set_sensor_data_flash_mutex(struct k_mutex *s_data_mutex)
 {
 	sensor_data_flash_mutex = s_data_mutex;
 }

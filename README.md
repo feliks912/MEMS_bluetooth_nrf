@@ -5,19 +5,22 @@
 Code for nRF54l15 SoC on an nRF54l15dk board for low power logging and data transfer of a MEMS microphone.
 
 ## To Do
-MTU and connection parameters (done)
-Long data read (done)
+deep sleep during timeout (partially -> bt disable)
+
 Data circular file
-Persistent BLE characteristics (done)
-mutex on flash io (kind of taken care of)
-local adv interval?
-flash case read 0 lenght (done)
-calculate remaining memory percentage (partially done)
-put all peripheral to deep sleep during timeout
-fix transfer length issues (done)
+local adv interval
 check for space left before appending, otherwise only some bytes might get appended.
-Add button debouncing
-MTU defining packet size instead of a hardcoded value
+button debouncing
+read retry on partial data read
+real data format
+
+MTU defining packet size instead of a hardcoded value (done)
+fix long data read transfer length issues (done)
+calculate remaining memory percentage (done)
+mutex on flash io (done per variable)
+Persistent BLE characteristics (done)
+MTU and connection parameters (done)
+flash case read 0 lenght (done)
 
 ## Notes
 

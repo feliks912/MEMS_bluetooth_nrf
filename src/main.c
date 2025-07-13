@@ -34,16 +34,18 @@
 #include <zephyr/drivers/timer/system_timer.h>
 
 #include <zephyr/random/random.h>
-
-#include <nrfx_timer.h>
+#include <zephyr/sys/atomic.h>
 
 #include <errno.h>
 
 #define BLE_STATIC_ADDR {0xFF, 0x00, 0x11, 0x22, 0x33, 0x33}
 
-#define SENSOR_DATA_BUFFER_SIZE_MAX 10
+#define SENSOR_DATA_TRANSFER_TO_FLASH_THRESHOLD 10
+#define SENSOR_DATA_BUFFER_SIZE_MAX SENSOR_DATA_TRANSFER_TO_FLASH_THRESHOLD * 10
 
 #define WORQ_THREAD_STACK_SIZE 2048
+
+static int bt_conn_counter = 0;
 
 LOG_MODULE_REGISTER(main_logger, LOG_LEVEL_DBG);
 
@@ -79,13 +81,21 @@ static struct gpio_callback button1_cb;
 static struct gpio_callback button2_cb;
 static struct gpio_callback button3_cb;
 
+static bool button0_pressed = false;
+static bool button1_pressed = false;
+static bool button2_pressed = false;
+static bool button3_pressed = false;
+
 #define LED_RUN_BLINK_INTERVAL 1000
 
 // ------ ADVERTISING -------
 
+static void cb_bt_ready(int err);
+
 static bool pairing_mode = false;
 static int bt_identity_static = -1;
 static bool advertising_in_progress = false;
+atomic_t bt_connected = ATOMIC_INIT(0);
 
 static struct k_work_delayable work_adv;
 
@@ -95,6 +105,8 @@ struct adv_mfg_data
 	bool device_initialized;
 	uint16_t sensor_data_length;
 } __packed;
+
+K_MUTEX_DEFINE(app_adv_mfg_data_mutex);
 
 // FIXME: Set device initialized when unix timestamp has ben
 static struct adv_mfg_data app_adv_mfg_data = {
@@ -130,11 +142,11 @@ static void cb_accept_list_cb(const struct bt_bond_info *info, void *user_data)
 	}
 
 	int err = bt_le_filter_accept_list_add(&info->addr);
-	LOG_INF("Added following peer to accept list: %x %x\n", info->addr.a.val[0],
+	LOG_INF("Added following peer to accept list: %x %x", info->addr.a.val[0],
 			info->addr.a.val[1]);
 	if (err)
 	{
-		LOG_INF("Cannot add peer to filter accept list (err: %d)\n", err);
+		LOG_ERR("Cannot add peer to filter accept list (err: %d)", err);
 		(*bond_cnt) = -EIO;
 	}
 	else
@@ -160,32 +172,12 @@ static int accept_list_setup(uint8_t local_id)
 	return bond_cnt;
 }
 
-static void work_adv_handler(struct k_work *work)
+static void adv_start()
 {
-	int err = 0;
-
-	if (advertising_in_progress)
-	{ // Stop advertising and schedule the work to run after adv_dur_ms
-		err = bt_le_adv_stop();
-		if (err < 0)
-		{
-			LOG_ERR("Failed to stop advertising. Err %d", err);
-			return;
-		}
-
-		uint16_t adv_int_g_ms = get_adv_int_g_ms();
-
-		if (adv_int_g_ms == 0)
-		{
-			LOG_ERR("Failed to schedule advertising work. Global advertising interval is %d", adv_int_g_ms);
-			return;
-		}
-
-		LOG_INF("Advertising stopped. Work scheduled after %d.", adv_int_g_ms);
-		advertising_ready = true;
-		advertising_in_progress = false;
-		k_work_schedule(&work_adv, K_MSEC(adv_int_g_ms));
-
+	int err = k_mutex_lock(&app_adv_mfg_data_mutex, K_FOREVER);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to lock app_adv_mfg_data_mutex. Err %d", err);
 		return;
 	}
 
@@ -196,7 +188,7 @@ static void work_adv_handler(struct k_work *work)
 		err = bt_le_filter_accept_list_clear();
 		if (err)
 		{
-			LOG_INF("Cannot clear accept list (err: %d)\n", err);
+			LOG_ERR("Cannot clear accept list (err: %d)", err);
 		}
 		else
 		{
@@ -207,69 +199,119 @@ static void work_adv_handler(struct k_work *work)
 							  ARRAY_SIZE(sd));
 		if (err)
 		{
-			LOG_INF("Advertising failed to start (err %d)\n", err);
+			LOG_ERR("Advertising failed to start (err %d)", err);
+			k_mutex_unlock(&app_adv_mfg_data_mutex);
 			return;
 		}
-
-		LOG_INF("Advertising successfully started\n");
-
-		advertising_ready = false;
-		advertising_in_progress = true;
-
-		uint16_t adv_dur_ms = get_adv_dur_ms();
-
-		k_work_schedule(&work_adv, K_MSEC(adv_dur_ms));
-
-		return;
 	}
-	/* STEP 3.4.1 - Remove the original code that does normal advertising */
-
-	// err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
-	//  if (err) {
-	//  	LOG_INF("Advertising failed to start (err %d)\n", err);
-	//  	return;
-	//  }
-	// LOG_INF("Advertising successfully started\n");
-
-	/* STEP 3.4.2 - Start advertising with the Accept List */
-	if (bt_identity_static != -1)
+	else if (bt_identity_static != -1)
 	{ // Static BT identity successfuly created.
 		int allowed_cnt = accept_list_setup(bt_identity_static);
 		if (allowed_cnt < 0)
 		{
-			LOG_INF("Acceptlist setup failed (err:%d)\n", allowed_cnt);
+			LOG_ERR("Acceptlist setup failed. Err: %d", allowed_cnt);
 		}
 		else
 		{
 			if (allowed_cnt == 0)
 			{
-				LOG_INF("Advertising with no Accept list \n");
+				LOG_INF("Advertising with no Accept list");
 				err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd,
 									  ARRAY_SIZE(sd));
 			}
 			else
 			{
-				LOG_INF("Advertising with Accept list \n");
-				LOG_INF("Acceptlist setup number = %d \n", allowed_cnt);
+				LOG_INF("Advertising	 with Accept list.");
+				LOG_DBG("Acceptlist setup number = %d.", allowed_cnt);
 				err = bt_le_adv_start(BT_LE_ADV_CONN_ACCEPT_LIST, ad, ARRAY_SIZE(ad), sd,
 									  ARRAY_SIZE(sd));
 			}
 			if (err)
 			{
-				LOG_INF("Advertising failed to start (err %d)\n", err);
+				LOG_ERR("Advertising failed to start. Err %d", err);
+				k_mutex_unlock(&app_adv_mfg_data_mutex);
+
 				return;
 			}
-
-			LOG_INF("Advertising successfully started. Will advertise for %d milliseconds", get_adv_dur_ms());
-
-			advertising_ready = false;
-			advertising_in_progress = true;
-			k_work_schedule(&work_adv, K_MSEC(get_adv_dur_ms()));
 		}
+	}
+
+	uint16_t adv_dur = get_adv_dur_ms();
+
+	LOG_INF("Advertising started for %d ms.", adv_dur);
+
+	advertising_ready = false;
+	advertising_in_progress = true;
+
+	k_work_schedule(&work_adv, K_MSEC(adv_dur));
+	k_mutex_unlock(&app_adv_mfg_data_mutex);
+}
+
+static void adv_stop()
+{
+	int err = bt_le_adv_stop();
+	if (err < 0)
+	{
+		LOG_ERR("Failed to stop advertising. Err %d", err);
+		return;
+	}
+
+	err = bt_disable();
+	if (err < 0)
+	{
+		LOG_ERR("Failed to disable bt in adv handler.");
+	}
+	LOG_INF("BT disabled.");
+
+	uint16_t adv_int_g_ms = get_adv_int_g_ms(); // FIXME: Could this be the issue?
+
+	if (adv_int_g_ms == 0)
+	{
+		LOG_ERR("Failed to schedule advertising work. Global advertising interval is %d", adv_int_g_ms);
+		return;
+	}
+
+	LOG_INF("Advertising stopped for %d ms.", adv_int_g_ms);
+	advertising_ready = true;
+	advertising_in_progress = false;
+
+	k_work_schedule(&work_adv, K_MSEC(adv_int_g_ms));
+
+	return;
+}
+
+static void bt_enable_adv_start(int err){
+	cb_bt_ready(err);
+	adv_start();
+}
+
+static void work_adv_handler(struct k_work *work)
+{
+	int err = 0;
+
+	if (get_sensor_data_read_in_progress())
+	{
+		return;
+	}
+	else if (!bt_is_ready())
+	{
+		err = bt_enable(bt_enable_adv_start);
+		if (err < 0)
+		{
+			LOG_ERR("Failed to re-enable bt in adv handler. Err %d", err);
+			return;
+		}
+		LOG_INF("BT enabled.");
+	}
+	else if (advertising_in_progress)
+	{
+		adv_stop();
+	} else {
+		adv_start();
 	}
 }
 
-static void advertising_start(void)
+static void cb_advertising_start(void)
 {
 	LOG_DBG("Advertising work submitted.");
 	k_work_schedule(&work_adv, K_NO_WAIT);
@@ -313,16 +355,22 @@ static void cb_bt_on_connected(struct bt_conn *conn, uint8_t err)
 {
 	if (err)
 	{
-		LOG_INF("Connection failed (err %u)\n", err);
+		LOG_INF("Connection failed. Err %d", err);
 		return;
 	}
 
-	LOG_INF("Connected. Requesting data length and mtu updates.");
+	k_work_cancel_delayable(&work_adv);
+
+	bt_conn_counter++;
+
+	atomic_set(&bt_connected, 1);
+
+	LOG_WRN("Connected. Requesting data length and mtu updates.");
 
 	update_data_length(conn);
 	// update_mtu(conn);
 
-	LOG_INF("Connected. MTU is %u, uatt MTU is %d\n", bt_gatt_get_mtu(conn), bt_gatt_get_uatt_mtu(conn));
+	LOG_INF("Connected. MTU is %u, uatt MTU is %d", bt_gatt_get_mtu(conn), bt_gatt_get_uatt_mtu(conn));
 
 	gpio_pin_set_dt(&led0, 1);
 }
@@ -341,8 +389,30 @@ static void cb_bt_on_connected(struct bt_conn *conn, uint8_t err)
  */
 static void cb_bt_on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	LOG_INF("Disconnected (reason %u)\n", reason);
+
+	atomic_set(&bt_connected, 0);
+
+	LOG_WRN("Disconnected. Reason %d", reason);
 	gpio_pin_set_dt(&led0, 0);
+
+	int err = bt_disable();
+	if (err < 0)
+	{
+		LOG_ERR("Failed to disable bluetooth.");
+	}
+	LOG_INF("BT disabled.");
+
+	uint16_t adv_int_g_ms = get_adv_int_g_ms();
+
+	if (adv_int_g_ms == 0)
+	{
+		LOG_ERR("Failed to schedule advertising work. Global advertising interval is %d", adv_int_g_ms);
+		return;
+	}
+
+	LOG_INF("Scheduled advertising restart in %d ms.", adv_int_g_ms);
+
+	k_work_schedule(&work_adv, K_MSEC(adv_int_g_ms));
 }
 
 /** @brief BT connection object is released and ready for use
@@ -354,8 +424,8 @@ static void cb_bt_on_disconnected(struct bt_conn *conn, uint8_t reason)
  */
 static void cb_bt_recycled(void)
 {
-	LOG_INF("Connection object available from previous conn. Advertising ready.\n");
-	// advertising_start();
+	LOG_INF("Connection object available. Advertising ready.");
+	// cb_advertising_start();
 	advertising_ready = true;
 }
 
@@ -378,11 +448,11 @@ static void cb_bt_on_security_changed(struct bt_conn *conn, bt_security_t level,
 
 	if (!err)
 	{
-		LOG_INF("Security changed: %s level %u\n", addr, level);
+		LOG_INF("Security changed: %s level %u", addr, level);
 	}
 	else
 	{
-		LOG_INF("Security failed: %s level %u err %s\n", addr, level, bt_security_err_to_str(err));
+		LOG_INF("Security failed: %s level %u err %s", addr, level, bt_security_err_to_str(err));
 	}
 }
 
@@ -401,7 +471,8 @@ static bool cb_bt_on_le_param_req(struct bt_conn *conn, struct bt_le_conn_param 
 {
 	// TODO: Filter parameters if unacceptable
 
-	LOG_INF("cb_bt_on_le_param_req triggered.");
+	LOG_WRN("cb_bt_on_le_param_req triggered. Int min: %d, Int max: %d, Latency: %d, Timeout: %d",
+			param->interval_min, param->interval_max, param->latency, param->timeout);
 
 	return true;
 }
@@ -418,7 +489,7 @@ static bool cb_bt_on_le_param_req(struct bt_conn *conn, struct bt_le_conn_param 
  */
 static void cb_bt_on_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency, uint16_t timeout)
 {
-	LOG_INF("cb_bt_on_le_param_updated triggered.");
+	LOG_WRN("cb_bt_on_le_param_updated triggered. Interval: %d, latency: %d, timeout: %d", interval, latency, timeout);
 }
 
 struct bt_conn_cb connection_callbacks = {
@@ -437,7 +508,7 @@ static void cb_bt_auth_passkey_display(struct bt_conn *conn, unsigned int passke
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	LOG_INF("Passkey for %s: %06u\n", addr, passkey);
+	LOG_WRN("Passkey for %s: %06u", addr, passkey);
 }
 
 /** @brief Pairing request callback
@@ -495,7 +566,7 @@ static void cb_bt_auth_cancel(struct bt_conn *conn)
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	LOG_INF("Pairing cancelled: %s\n", addr);
+	LOG_INF("Pairing cancelled: %s", addr);
 }
 
 static struct bt_conn_auth_cb conn_auth_callbacks = {
@@ -541,8 +612,13 @@ typedef struct
 	uint8_t *raw_data;
 } sensor_data_t;
 
-static sensor_data_t sensor_data_buffer[(2 * SENSOR_DATA_BUFFER_SIZE_MAX)]; // 2x for storing values during BLE transfer.
+static sensor_data_t sensor_data_buffer[SENSOR_DATA_BUFFER_SIZE_MAX]; // 2x for storing values during BLE transfer.
 static K_MUTEX_DEFINE(sensor_data_flash_mutex);
+static K_MUTEX_DEFINE(sensor_data_buffer_mutex);
+
+static K_SEM_DEFINE(sensor_data_buffer_sem, 1, 1);
+
+uint32_t log_total_data_length_in_flash = 0;
 
 static ssize_t sensor_data_buffer_size = 0;
 static int64_t previous_sync_unix_time_ms = 0;
@@ -554,7 +630,15 @@ sensor_data_t app_sensor_data;
 
 sensor_data_t *sensor_data_generate()
 {
-	LOG_INF("Generating sensor data...");
+
+	int err = k_sem_take(&sensor_data_buffer_sem, K_FOREVER);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to take sensor data buffer semaphore. Err %d", err);
+		return NULL;
+	}
+
+	LOG_DBG("Generating sensor data...");
 
 	uint8_t data_length = sys_rand8_get() % 100 + 1;
 
@@ -579,62 +663,9 @@ sensor_data_t *sensor_data_generate()
 	app_sensor_data.data_length = data_length;
 	app_sensor_data.raw_data = raw_data;
 
-	LOG_INF("Generated sensor data sample of %d elements at time %d.", app_sensor_data.data_length, app_sensor_data.time_delta);
+	LOG_DBG("Generated sensor data sample of %d elements at time %d.", app_sensor_data.data_length, app_sensor_data.time_delta);
 
 	return &app_sensor_data;
-}
-
-uint32_t log_total_data_length_in_flash = 0;
-
-#define HEX_CHUNK_BUFFER_SIZE_BYTES 16								// How many raw bytes to process in one hex formatting chunk
-#define HEX_OUTPUT_STRING_LEN (HEX_CHUNK_BUFFER_SIZE_BYTES * 3 + 1) // (16*2 for hex chars) + (16-1 for spaces) + 1 for null terminator = 32 + 15 + 1 = 48
-
-// Helper function to print a specific buffer in hex
-void print_buffer_hex(const uint8_t *buffer, size_t length)
-{
-	// Use a local static buffer to avoid stack overflow for large lengths,
-	// and to persist between calls if needed (though not strictly necessary here).
-	// The buffer size is chosen to be reasonable for a single printk call.
-	char hex_string_buffer[HEX_OUTPUT_STRING_LEN];
-	int hex_string_idx;
-
-	size_t current_offset = 0;
-
-	while (current_offset < length)
-	{
-		// Determine how many raw bytes to process in this chunk
-		size_t bytes_to_process = length - current_offset;
-		if (bytes_to_process > HEX_CHUNK_BUFFER_SIZE_BYTES)
-		{
-			bytes_to_process = HEX_CHUNK_BUFFER_SIZE_BYTES;
-		}
-
-		hex_string_idx = 0; // Reset index for the new hex string chunk
-
-		// Format the raw bytes into a hexadecimal string
-		for (size_t k = 0; k < bytes_to_process; k++)
-		{
-			// Convert byte to two hex characters
-			// Use static const char for hex_digits to avoid re-initialization
-			static const char hex_digits[] = "0123456789abcdef";
-			hex_string_buffer[hex_string_idx++] = hex_digits[(buffer[current_offset + k] >> 4) & 0xF];
-			hex_string_buffer[hex_string_idx++] = hex_digits[buffer[current_offset + k] & 0xF];
-
-			// Add a space between hex values for readability, except after the last byte of the chunk
-			if (k < bytes_to_process - 1)
-			{
-				hex_string_buffer[hex_string_idx++] = ' ';
-			}
-		}
-		// Null-terminate the formatted hex string
-		hex_string_buffer[hex_string_idx] = '\0';
-
-		// Print the entire formatted string with a single printk call
-		printk("%s", hex_string_buffer); // Add newline after each chunk
-
-		// Advance the offset
-		current_offset += bytes_to_process;
-	}
 }
 
 sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
@@ -655,7 +686,7 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 		return NULL;
 	}
 
-	if (sync_unix_time != previous_sync_unix_time_ms && !get_sensor_data_read_in_progress())
+	if (atomic_get(&bt_connected) == 0 && sync_unix_time != previous_sync_unix_time_ms)
 	{ // First sensor readout after BLE time sync and after reading sensor data. Prevents data being written to flash during transfer.
 		previous_sync_unix_time_ms = sync_unix_time;
 
@@ -666,17 +697,20 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 		}
 		previous_sensor_data_time = get_uptime_at_sync_ms();
 
-		err = data_overwrite(FILE_SENSOR_DATA_LOCATION, &sync_unix_time, sizeof(sync_unix_time));
-		if (err < 0)
+		if (bt_conn_counter < 200)
 		{
-			LOG_ERR("Failed to add sensor data element to buffer. Failed to write first timestamp to file %s. Data_write returned with %d", FILE_SENSOR_DATA_LOCATION, err);
-			return NULL;
+			err = data_overwrite(FILE_SENSOR_DATA_LOCATION, &sync_unix_time, sizeof(sync_unix_time));
+			if (err < 0)
+			{
+				LOG_ERR("Failed to add sensor data element to buffer. Failed to write first timestamp to file %s. Data_write returned with %d", FILE_SENSOR_DATA_LOCATION, err);
+				return NULL;
+			}
+
+			set_sensor_data_length(0);
+			log_total_data_length_in_flash = 0;
+
+			LOG_INF("Flash sensor data cleared.");
 		}
-
-		set_sensor_data_length(0);
-		log_total_data_length_in_flash = 0;
-
-		LOG_INF("Sensor data in flash has been cleared.");
 	}
 
 	uint32_t current_uptime = sensor_data->time_delta; // k_sys_uptime_get has been stored in time_delta
@@ -687,7 +721,7 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 
 	bool sensor_data_flash_mutex_locked = false;
 
-	LOG_ERR("Locking sensor_data_flash_mutex");
+	LOG_DBG("Locking sensor_data_flash_mutex");
 
 	err = k_mutex_lock(&sensor_data_flash_mutex, K_NO_WAIT); // Don't wait
 	if (err != 0)
@@ -697,116 +731,138 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 	else
 	{
 		sensor_data_flash_mutex_locked = true;
-		
-		if (sensor_data_buffer_size >= SENSOR_DATA_BUFFER_SIZE_MAX && !get_sensor_data_read_in_progress())
-		{ // Store to flash and reset
-			sensor_data_flash_mutex_locked = true;
 
-			// FIXME: What if the bluetooth transfer happens HERE?
+		if (sensor_data_buffer_size >= SENSOR_DATA_TRANSFER_TO_FLASH_THRESHOLD)
+		{
+			LOG_DBG("sensor data buffer filled. checking BT connection.");
 
-			LOG_INF("Sensor data buffer filled. Transfer to flash initiated.");
-
-			uint64_t total_data_size_bytes = sensor_data_buffer_size * (sizeof(sensor_data->time_delta) + sizeof(sensor_data->data_length));
-
-			for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
+			if (atomic_get(&bt_connected) == 0) // If disconnected
 			{
-				total_data_size_bytes += sensor_data_buffer[i].data_length;
-			}
+				sensor_data_flash_mutex_locked = true;
 
-			if (total_data_size_bytes == 0)
-			{
-				LOG_ERR("Total sensor buffer data size in bytes is 0.");
-				LOG_ERR("Unlocking sensor_data_flash_mutex");
+				// FIXME: What if the bluetooth transfer happens HERE?
 
-				k_mutex_unlock(&sensor_data_flash_mutex);
-				return NULL;
-			}
+				LOG_INF("Sensor data buffer filled. Transfer to flash initiated.");
 
-			uint8_t *data_p = (uint8_t *)malloc(total_data_size_bytes * sizeof(uint8_t));
-			if (data_p == NULL)
-			{
-				LOG_ERR("Failed to allocate memory for sensor data buffer transfer into flash.");
-				LOG_ERR("Unlocking sensor_data_flash_mutex");
-				k_mutex_unlock(&sensor_data_flash_mutex);
-				return NULL;
-			}
+				uint64_t total_data_buffer_size_bytes = sensor_data_buffer_size * (sizeof(sensor_data->time_delta) + sizeof(sensor_data->data_length));
 
-			uint64_t ptr_offset = 0;
-
-			LOG_DBG("Starting pointer arithmetic.");
-
-			for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
-			{
-				for (uint8_t j = 0; j < sizeof(sensor_data->time_delta); j++) // TODO: Remove hardcode
+				for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
 				{
-					*(data_p + ptr_offset++) = (sensor_data_buffer[i].time_delta >> (j * 8)) && 0xFF;
+					total_data_buffer_size_bytes += sensor_data_buffer[i].data_length;
 				}
 
-				*(data_p + ptr_offset++) = sensor_data_buffer[i].data_length;
-
-				// TODO: Works only if the data type is of type uint8_t
-				for (uint8_t j = 0; j < sensor_data_buffer[i].data_length; j++)
+				if (total_data_buffer_size_bytes == 0)
 				{
-					*(data_p + ptr_offset++) = *(sensor_data_buffer[i].raw_data + j);
+					LOG_ERR("Total sensor buffer data size in bytes is 0.");
+					LOG_DBG("Unlocking sensor_data_flash_mutex and clearing sensor data buffer.");
+					sensor_data_buffer_clear();
+
+					k_mutex_unlock(&sensor_data_flash_mutex);
+					return NULL;
 				}
 
-				free(sensor_data_buffer[i].raw_data);
-				sensor_data_buffer[i].raw_data = NULL;
+				if (bt_conn_counter < 200)
+				{
+					uint8_t *data_p = (uint8_t *)malloc(total_data_buffer_size_bytes * sizeof(uint8_t));
+
+					if (data_p == NULL)
+					{
+						LOG_ERR("Failed to allocate memory for sensor data buffer transfer into flash.");
+						LOG_DBG("Unlocking sensor_data_flash_mutex");
+						sensor_data_buffer_clear();
+
+						k_mutex_unlock(&sensor_data_flash_mutex);
+						return NULL;
+					}
+
+					uint64_t ptr_offset = 0;
+
+					for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
+					{
+
+						for (uint8_t j = 0; j < sizeof(sensor_data->time_delta); j++) // TODO: Remove hardcode
+						{
+							*(data_p + ptr_offset++) = (sensor_data_buffer[i].time_delta >> (j * 8)) & 0xFF;
+						}
+
+						*(data_p + ptr_offset++) = sensor_data_buffer[i].data_length;
+
+						// TODO: Works only if the data type is of type uint8_t
+						for (uint8_t j = 0; j < sensor_data_buffer[i].data_length; j++)
+						{
+							*(data_p + ptr_offset++) = *(sensor_data_buffer[i].raw_data + j);
+						}
+					}
+
+					LOG_DBG("Ending pointer arithmetic.");
+
+					if (ptr_offset != total_data_buffer_size_bytes)
+					{
+						LOG_ERR("Total sensor data length in bytes is not equal to pointer offset.");
+						LOG_DBG("Unlocking sensor_data_flash_mutex");
+
+						sensor_data_buffer_clear();
+
+						k_mutex_unlock(&sensor_data_flash_mutex);
+						free(data_p);
+						return NULL;
+					}
+
+					err = data_append(FILE_SENSOR_DATA_LOCATION, data_p, total_data_buffer_size_bytes);
+					if (err < 0)
+					{
+						LOG_ERR("Failed to append sensor data to flash: %d", err);
+						LOG_DBG("Unlocking sensor_data_flash_mutex");
+
+						sensor_data_buffer_clear();
+
+						k_mutex_unlock(&sensor_data_flash_mutex);
+						free(data_p);
+						return NULL;
+					}
+
+					set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
+					log_total_data_length_in_flash += sensor_data_buffer_size;
+
+					LOG_DBG("Freeing data_p pointer");
+					free(data_p);
+				}
+				else
+				{
+					LOG_WRN("Skip adding to flash.");
+				}
+
+				LOG_WRN("before sensor data buffer clear.");
+				sensor_data_buffer_clear();
+				LOG_WRN("after sensor data buffer clear.");
 			}
-
-			LOG_DBG("Ending pointer arithmetic.");
-
-			if (ptr_offset != total_data_size_bytes)
+			else
 			{
-				LOG_ERR("Total sensor data length in bytes is not equal to pointer offset.");
-				LOG_ERR("Unlocking sensor_data_flash_mutex");
-
-				k_mutex_unlock(&sensor_data_flash_mutex);
-				free(data_p);
-				return NULL;
+				LOG_DBG("sensor data buffer is filled, but BT connection is still active.");
 			}
-
-			err = data_append(FILE_SENSOR_DATA_LOCATION, data_p, total_data_size_bytes);
-			if (err < 0)
-			{
-				LOG_ERR("Failed to append sensor data to flash: %d", err);
-				LOG_ERR("Unlocking sensor_data_flash_mutex");
-
-				k_mutex_unlock(&sensor_data_flash_mutex);
-				free(data_p);
-				return NULL;
-			}
-
-			set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
-			log_total_data_length_in_flash += sensor_data_buffer_size;
-
-			sensor_data_buffer_clear();
-			sensor_data_buffer_size = 0;
-
-			// print_buffer_hex(data_p, total_data_size_bytes);
-
-			LOG_DBG("Freeing data_p pointer");
-
-			free(data_p);
-
-			// print_zephyr_fs_details();
 		}
 	}
 
 	// TODO: Add sensor data mutex
 
+	LOG_WRN("adding to sensor data buffer.");
+
 	sensor_data_buffer[sensor_data_buffer_size++] = *sensor_data;
+
+	LOG_WRN("after adding to sensor data buffer.");
 
 	if (sensor_data_flash_mutex_locked)
 	{
-		LOG_ERR("Unlocking sensor_data_flash_mutex");
+		LOG_DBG("Unlocking sensor_data_flash_mutex");
 
 		k_mutex_unlock(&sensor_data_flash_mutex);
 	}
 
-	LOG_INF("Sensor data info: timestamp[ms]: %d, data length: %d", sensor_data->time_delta, sensor_data->data_length);
+	LOG_DBG("Sensor data info: timestamp[ms]: %d, data length: %d", sensor_data->time_delta, sensor_data->data_length);
 
-	LOG_INF("Added sensor data element to sensor data buffer. Sensor data buffer's length is now %d. Total sensor data length in flash is %d", sensor_data_buffer_size, log_total_data_length_in_flash);
+	LOG_INF("New sensor data element in buffer. Buffer length %d. Total elements in flash %d", sensor_data_buffer_size, log_total_data_length_in_flash);
+
+	k_sem_give(&sensor_data_buffer_sem);
 
 	return &sensor_data_buffer[sensor_data_buffer_size - 1];
 }
@@ -868,11 +924,15 @@ bool sensor_data_buffer_clear()
 		return false;
 	}
 
-	for (size_t i = 0; i <= sensor_data_buffer_size; i++)
+	LOG_WRN("before sensor data buffer clear loop.");
+
+	for (size_t i = 0; i < sensor_data_buffer_size; i++)
 	{
 		free(sensor_data_buffer[i].raw_data);
 		sensor_data_buffer[i].raw_data = NULL;
 	}
+
+	LOG_WRN("after sensor data buffer clear loop.");
 
 	k_mutex_unlock(&sensor_data_flash_mutex);
 
@@ -895,15 +955,13 @@ void work_blink_handler()
 
 // ------- INITIALIZATION --------
 
-static void bt_ready(int err)
+static void cb_bt_ready(int err)
 {
 	if (err)
 	{
 		LOG_ERR("Bluetooth init failed (err %d)", err);
 		return;
 	}
-
-	LOG_INF("Bluetooth initialized");
 
 	err = settings_load();
 	if (err == 0)
@@ -915,9 +973,58 @@ static void bt_ready(int err)
 		LOG_ERR("main: Failed to load settings. Err %d.", err);
 	}
 
-	// All Bluetooth subsystems are ready. Now we can start advertising.
-	// advertising_start();
+	
+	LOG_DBG("Checking and creating BT identity.");
+	
+	uint8_t addr[] = BLE_STATIC_ADDR;
+
+	addr[5] |= 0xC0;
+
+	bt_addr_le_t le_addr = {
+		.type = BT_ADDR_LE_RANDOM,
+	};
+
+	memcpy(le_addr.a.val, addr, sizeof(addr));
+
+	size_t count = CONFIG_BT_ID_MAX;
+	bt_addr_le_t read_addr[CONFIG_BT_ID_MAX];
+	bt_id_get(read_addr, &count);
+	if (count > 0)
+	{
+		LOG_INF("%d BLE addresses available. Using BLE addr: %02X:%02X:%02X:%02X:%02X:%02X", count,
+				read_addr[0].a.val[5], read_addr[0].a.val[4], read_addr[0].a.val[3], read_addr[0].a.val[2], read_addr[0].a.val[1], read_addr[0].a.val[0]);
+	}
+	else
+	{
+		LOG_ERR("Can't get BLE addr. Err %d (%s)", count, bt_att_err_to_str(count));
+	}
+
+	err = bt_id_create(&le_addr, NULL);
+	if (err < 0)
+	{
+		LOG_ERR("Failed to create BT identity. Err %d (%s)", err, bt_att_err_to_str(err));
+	}
+	else
+	{
+		bt_identity_static = err;
+		LOG_INF("Static BT identity %d created.", err);
+	}
+
+	
+	bt_id_get(read_addr, &count);
+	if (count > 0)
+	{
+		LOG_INF("%d BLE addresses available. Using BLE addr: %02X:%02X:%02X:%02X:%02X:%02X", count,
+				read_addr[0].a.val[5], read_addr[0].a.val[4], read_addr[0].a.val[3], read_addr[0].a.val[2], read_addr[0].a.val[1], read_addr[0].a.val[0]);
+	}
+	else
+	{
+		LOG_ERR("Can't get BLE addr. Err %d (%s)", count, bt_att_err_to_str(count));
+	}
+
 	advertising_ready = true;
+
+	LOG_INF("Bluetooth initialized");
 }
 
 bool gen_working = false;
@@ -1082,24 +1189,73 @@ int gpio_init()
 void work_sensor_data_gen_delayable_handler()
 {
 	sensor_data_buffer_element_add(sensor_data_generate());
-	k_work_schedule(&work_sensor_data_gen_delayable, K_MSEC(500));
+	k_work_schedule(&work_sensor_data_gen_delayable, K_MSEC(300));
 }
 
 void work_sensor_data_gen_handler()
 {
-	sensor_data_buffer_element_add(sensor_data_generate());
+	for (int i = 0; i < 300; i++)
+	{
+		sensor_data_buffer_element_add(sensor_data_generate());
+	}
 }
 
 void work_gpio_irq_log_handler()
 {
 	if (advertising_ready)
 	{
-		advertising_start();
+		cb_advertising_start();
 	}
 	else
 	{
 		LOG_INF("Can't manually start advertising, advertising is not ready.");
 	}
+}
+
+int init_bt()
+{
+	// ------- LOAD CHARACTERISTICS FROM FLASH MEMORY -------
+
+	int err = char_init_values();
+	if (err < 0)
+	{
+		LOG_ERR("Failed to restore characteristics from flash, but since this might be the first time they might not exist. Continuing.");
+	}
+	else
+	{
+		LOG_INF("Successfuly restored characteristics from flash.");
+	}
+
+	// ------- SETUP STATIC RANDOM MAC ADDRESS -------
+
+	err = bt_conn_auth_cb_register(&conn_auth_callbacks);
+	if (err < 0)
+	{
+		LOG_ERR("Bluetooth connection authentication callbacks failed to register. Err %d", err);
+	}
+
+	err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
+	if (err < 0)
+	{
+		LOG_ERR("Bluetooth connection authentication information callbacks failed to register. Err %d", err);
+	}
+
+	err = bt_conn_cb_register(&connection_callbacks);
+	if (err < 0)
+	{
+		LOG_ERR("Bluetooth connection callback failed to register. Err %d", err);
+	}
+
+	err = bt_enable(cb_bt_ready);
+	if (err)
+	{
+		LOG_INF("Bluetooth init failed. Err %d (%s)", err, bt_att_err_to_str(err));
+		return -1;
+	}
+
+	LOG_INF("Bluetooth initialized");
+
+	return 0;
 }
 
 int init_all()
@@ -1135,7 +1291,7 @@ int init_all()
 
 	k_work_init_delayable(&work_sensor_data_gen_delayable, work_sensor_data_gen_delayable_handler);
 
-	set_sensor_data_mutex(&sensor_data_flash_mutex);
+	set_sensor_data_flash_mutex(&sensor_data_flash_mutex);
 
 	err = register_device_initialized_p(&app_adv_mfg_data.device_initialized);
 	if (err < 0)
@@ -1144,81 +1300,12 @@ int init_all()
 		return -1;
 	}
 
-	// ------- LOAD CHARACTERISTICS FROM FLASH MEMORY -------
-
-	err = char_init_values();
+	err = init_bt();
 	if (err < 0)
 	{
-		LOG_ERR("Failed to restore characteristics from flash, but since this might be the first time they might not exist. Continuing.");
-	}
-	else
-	{
-		LOG_INF("Successfuly restored characteristics from flash.");
-	}
-
-	// ------- SETUP STATIC RANDOM MAC ADDRESS -------
-
-	uint8_t addr[] = BLE_STATIC_ADDR;
-
-	addr[5] |= 0xC0;
-
-	bt_addr_le_t le_addr = {
-		.type = BT_ADDR_LE_RANDOM,
-	};
-
-	memcpy(le_addr.a.val, addr, sizeof(addr));
-
-	err = bt_id_create(&le_addr, NULL);
-	if (err < 0)
-	{
-		LOG_ERR("Failed to create BT identity. Err %d (%s)", err, bt_att_err_to_str(err));
-	}
-	else
-	{
-		bt_identity_static = err;
-		LOG_INF("Static BT identity %d created.", err);
-	}
-
-	size_t count = CONFIG_BT_ID_MAX;
-	bt_addr_le_t read_addr[CONFIG_BT_ID_MAX];
-	bt_id_get(read_addr, &count);
-
-	if (count > 0)
-	{
-		LOG_INF("Using BLE addr: %02X:%02X:%02X:%02X:%02X:%02X",
-				read_addr[0].a.val[5], read_addr[0].a.val[4], read_addr[0].a.val[3], read_addr[0].a.val[2], read_addr[0].a.val[1], read_addr[0].a.val[0]);
-	}
-	else
-	{
-		LOG_ERR("Can't get BLE addr. Err %d (%s)", count, bt_att_err_to_str(count));
-	}
-
-	err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-	if (err < 0)
-	{
-		LOG_ERR("Bluetooth connection authentication callbacks failed to register. Err %d", err);
-	}
-
-	err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
-	if (err < 0)
-	{
-		LOG_ERR("Bluetooth connection authentication information callbacks failed to register. Err %d", err);
-	}
-
-	err = bt_conn_cb_register(&connection_callbacks);
-	if (err < 0)
-	{
-		LOG_ERR("Bluetooth connection callback failed to register. Err %d", err);
-	}
-
-	err = bt_enable(bt_ready);
-	if (err)
-	{
-		LOG_INF("Bluetooth init failed. Err %d (%s)", err, bt_att_err_to_str(err));
+		LOG_ERR("Failed to initialize bluetooth.");
 		return -1;
 	}
-
-	LOG_INF("Bluetooth initialized\n");
 
 	return 0;
 }
@@ -1227,7 +1314,7 @@ int init_all()
 
 int main(void)
 {
-	LOG_INF("Starting init...\n");
+	LOG_INF("Starting init...");
 
 	int err;
 

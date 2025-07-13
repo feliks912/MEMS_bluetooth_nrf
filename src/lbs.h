@@ -104,7 +104,7 @@ uint16_t get_adv_int_g_ms(void);
 
 int register_device_initialized_p(bool *device_initialized);
 
-void set_sensor_data_mutex(struct k_mutex *s_data_mutex);
+void set_sensor_data_flash_mutex(struct k_mutex *s_data_mutex);
 
 
 #ifdef __cplusplus
