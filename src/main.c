@@ -43,18 +43,19 @@
 #define SENSOR_DATA_TRANSFER_TO_FLASH_THRESHOLD 10
 #define SENSOR_DATA_BUFFER_SIZE_MAX SENSOR_DATA_TRANSFER_TO_FLASH_THRESHOLD * 10
 
-#define WORQ_THREAD_STACK_SIZE 2048
+#define FREQUENCY_COMPONENTS_COUNT_MAX 16
 
-static int bt_conn_counter = 0;
+#define WORQ_THREAD_STACK_SIZE 2048
 
 LOG_MODULE_REGISTER(main_logger, LOG_LEVEL_DBG);
 
 FS_LITTLEFS_DECLARE_DEFAULT_CONFIG(storage);
+
 static struct fs_mount_t lfs_mnt = {
 	.type = FS_LITTLEFS,
-	.fs_data = &storage,										 // You don't need a separate fs_data struct for LittleFS
-	.storage_dev = (void *)FIXED_PARTITION_ID(littlefs_storage), // Use FIXED_PARTITION_ID
-	.mnt_point = FS_ROOT,										 // Choose a mount point
+	.fs_data = &storage,
+	.storage_dev = (void *)FIXED_PARTITION_ID(littlefs_storage),
+	.mnt_point = FS_ROOT,
 };
 
 #ifndef DEVICE_NAME
@@ -66,15 +67,22 @@ static struct fs_mount_t lfs_mnt = {
 
 #endif
 
+static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
+static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
+static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
+static const struct gpio_dt_spec led3 = GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios);
+
+#define GPIO_DEBOUNCE_TIME_MS 250
+
 static const struct gpio_dt_spec button0 = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), gpios);
 static const struct gpio_dt_spec button1 = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
 static const struct gpio_dt_spec button2 = GPIO_DT_SPEC_GET(DT_ALIAS(sw2), gpios);
 static const struct gpio_dt_spec button3 = GPIO_DT_SPEC_GET(DT_ALIAS(sw3), gpios);
 
-static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(DT_ALIAS(led0), gpios);
-static const struct gpio_dt_spec led1 = GPIO_DT_SPEC_GET(DT_ALIAS(led1), gpios);
-static const struct gpio_dt_spec led2 = GPIO_DT_SPEC_GET(DT_ALIAS(led2), gpios);
-static const struct gpio_dt_spec led3 = GPIO_DT_SPEC_GET(DT_ALIAS(led3), gpios);
+struct k_work_delayable work_button0_debounce;
+struct k_work_delayable work_button1_debounce;
+struct k_work_delayable work_button2_debounce;
+struct k_work_delayable work_button3_debounce;
 
 static struct gpio_callback button0_cb;
 static struct gpio_callback button1_cb;
@@ -280,7 +288,8 @@ static void adv_stop()
 	return;
 }
 
-static void bt_enable_adv_start(int err){
+static void bt_enable_adv_start(int err)
+{
 	cb_bt_ready(err);
 	adv_start();
 }
@@ -306,15 +315,11 @@ static void work_adv_handler(struct k_work *work)
 	else if (advertising_in_progress)
 	{
 		adv_stop();
-	} else {
+	}
+	else
+	{
 		adv_start();
 	}
-}
-
-static void cb_advertising_start(void)
-{
-	LOG_DBG("Advertising work submitted.");
-	k_work_schedule(&work_adv, K_NO_WAIT);
 }
 
 // ------- CALLBACKS -------
@@ -361,8 +366,6 @@ static void cb_bt_on_connected(struct bt_conn *conn, uint8_t err)
 
 	k_work_cancel_delayable(&work_adv);
 
-	bt_conn_counter++;
-
 	atomic_set(&bt_connected, 1);
 
 	LOG_WRN("Connected. Requesting data length and mtu updates.");
@@ -387,7 +390,7 @@ static void cb_bt_on_connected(struct bt_conn *conn, uint8_t err)
  * @param conn - Connection object.
  * @param reason – BT_HCI_ERR_* reason for the disconnection.
  */
-static void cb_bt_on_disconnected(struct bt_conn *conn, uint8_t reason)
+static void cb_bt_on_disconnected(struct bt_conn *conn, uint8_t	 reason)
 {
 
 	atomic_set(&bt_connected, 0);
@@ -539,11 +542,11 @@ static void cb_bt_auth_pairing_confirm(struct bt_conn *conn)
 
 	if (!err)
 	{
-		LOG_INF("Pairing approved successfuly to %s.", addr);
+		LOG_WRN("Pairing approved successfuly to %s.", addr);
 	}
 	else
 	{
-		LOG_INF("Pairing failed to aprove to %s.", addr);
+		LOG_WRN("Pairing failed to aprove to %s.", addr);
 	}
 }
 
@@ -604,12 +607,14 @@ static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
 // ------- SENSOR -------
 
 static struct k_work work_sensor_data_gen;
+struct k_work_delayable work_sensor_data_gen_delayable;
 
 typedef struct
 {
-	uint32_t time_delta;
-	uint8_t data_length;
-	uint8_t *raw_data;
+	uint16_t time_delta;
+	uint8_t temperature;
+	uint8_t humidity;
+	uint8_t amplitudes[FREQUENCY_COMPONENTS_COUNT_MAX];
 } sensor_data_t;
 
 static sensor_data_t sensor_data_buffer[SENSOR_DATA_BUFFER_SIZE_MAX]; // 2x for storing values during BLE transfer.
@@ -618,19 +623,21 @@ static K_MUTEX_DEFINE(sensor_data_buffer_mutex);
 
 static K_SEM_DEFINE(sensor_data_buffer_sem, 1, 1);
 
+bool gen_working = false;
+
 uint32_t log_total_data_length_in_flash = 0;
 
 static ssize_t sensor_data_buffer_size = 0;
 static int64_t previous_sync_unix_time_ms = 0;
 static uint32_t previous_sensor_data_time = 0;
 
-bool sensor_data_buffer_clear();
-
 sensor_data_t app_sensor_data;
+
+static uint16_t temperature_previous = 0;
+static uint16_t humidity_previous = 0;
 
 sensor_data_t *sensor_data_generate()
 {
-
 	int err = k_sem_take(&sensor_data_buffer_sem, K_FOREVER);
 	if (err < 0)
 	{
@@ -640,30 +647,64 @@ sensor_data_t *sensor_data_generate()
 
 	LOG_DBG("Generating sensor data...");
 
-	uint8_t data_length = sys_rand8_get() % 100 + 1;
-
-	if (app_sensor_data.raw_data != NULL)
+	if (temperature_previous != 0) // Changed from == 0
 	{
-		free(app_sensor_data.raw_data);
+		if (temperature_previous <= 20)
+		{
+			app_sensor_data.temperature = 21;
+		}
+		else if (temperature_previous >= 40)
+		{
+			app_sensor_data.temperature = 39;
+		}
+		else if (sys_rand8_get() % 2 == 0)
+		{
+			app_sensor_data.temperature = temperature_previous + 1;
+		}
+		else
+		{
+			app_sensor_data.temperature = temperature_previous - 1;
+		}
 	}
-
-	uint8_t *raw_data = (uint8_t *)malloc(data_length * sizeof(uint8_t));
-	if (raw_data == NULL)
+	else // This block runs if temperature_previous == 0
 	{
-		LOG_ERR("Failed to allocate memory for raw data.");
-		return NULL;
+		app_sensor_data.temperature = sys_rand8_get() % 21 + 20; // Temperature ranges between 20 and 40 degrees centigrade.
 	}
+	temperature_previous = app_sensor_data.temperature;
 
-	for (uint8_t i = 0; i < data_length; i++)
+	if (humidity_previous != 0) // Changed from == 0
 	{
-		*(raw_data + i) = sys_rand8_get();
+		if (humidity_previous <= 40)
+		{
+			app_sensor_data.humidity = 41;
+		}
+		else if (humidity_previous >= 80)
+		{
+			app_sensor_data.humidity = 79;
+		}
+		else if (sys_rand8_get() % 2 == 0)
+		{
+			app_sensor_data.humidity = humidity_previous + 1;
+		}
+		else
+		{
+			app_sensor_data.humidity = humidity_previous - 1;
+		}
+	}
+	else // This block runs if humidity_previous == 0
+	{
+		app_sensor_data.humidity = sys_rand8_get() % 41 + 40; // Humidity ranges between 40% and 80%.
+	}
+	humidity_previous = app_sensor_data.humidity;
+
+	for (int i = 0; i < FREQUENCY_COMPONENTS_COUNT_MAX; i++)
+	{
+		app_sensor_data.amplitudes[i] = sys_rand8_get(); // Amplitudes are between 0 and 255
 	}
 
 	app_sensor_data.time_delta = k_uptime_get();
-	app_sensor_data.data_length = data_length;
-	app_sensor_data.raw_data = raw_data;
 
-	LOG_DBG("Generated sensor data sample of %d elements at time %d.", app_sensor_data.data_length, app_sensor_data.time_delta);
+	LOG_DBG("Generated sensor data sample at time %d.", app_sensor_data.time_delta);
 
 	return &app_sensor_data;
 }
@@ -697,20 +738,17 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 		}
 		previous_sensor_data_time = get_uptime_at_sync_ms();
 
-		if (bt_conn_counter < 200)
+		err = data_overwrite(FILE_SENSOR_DATA_LOCATION, &sync_unix_time, sizeof(sync_unix_time));
+		if (err < 0)
 		{
-			err = data_overwrite(FILE_SENSOR_DATA_LOCATION, &sync_unix_time, sizeof(sync_unix_time));
-			if (err < 0)
-			{
-				LOG_ERR("Failed to add sensor data element to buffer. Failed to write first timestamp to file %s. Data_write returned with %d", FILE_SENSOR_DATA_LOCATION, err);
-				return NULL;
-			}
-
-			set_sensor_data_length(0);
-			log_total_data_length_in_flash = 0;
-
-			LOG_INF("Flash sensor data cleared.");
+			LOG_ERR("Failed to add sensor data element to buffer. Failed to write first timestamp to file %s. Data_write returned with %d", FILE_SENSOR_DATA_LOCATION, err);
+			return NULL;
 		}
+
+		set_sensor_data_length(0);
+		log_total_data_length_in_flash = 0;
+
+		LOG_INF("Flash sensor data cleared.");
 	}
 
 	uint32_t current_uptime = sensor_data->time_delta; // k_sys_uptime_get has been stored in time_delta
@@ -736,7 +774,7 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 		{
 			LOG_DBG("sensor data buffer filled. checking BT connection.");
 
-			if (atomic_get(&bt_connected) == 0) // If disconnected
+			if (atomic_get(&bt_connected) == 0) // If disconnected, begin serializing sensor data to store it to flash.
 			{
 				sensor_data_flash_mutex_locked = true;
 
@@ -744,97 +782,84 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 
 				LOG_INF("Sensor data buffer filled. Transfer to flash initiated.");
 
-				uint64_t total_data_buffer_size_bytes = sensor_data_buffer_size * (sizeof(sensor_data->time_delta) + sizeof(sensor_data->data_length));
-
-				for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
-				{
-					total_data_buffer_size_bytes += sensor_data_buffer[i].data_length;
-				}
+				uint64_t total_data_buffer_size_bytes = sensor_data_buffer_size * sizeof(app_sensor_data);
 
 				if (total_data_buffer_size_bytes == 0)
 				{
 					LOG_ERR("Total sensor buffer data size in bytes is 0.");
 					LOG_DBG("Unlocking sensor_data_flash_mutex and clearing sensor data buffer.");
-					sensor_data_buffer_clear();
+					sensor_data_buffer_size = 0;
 
 					k_mutex_unlock(&sensor_data_flash_mutex);
 					return NULL;
 				}
 
-				if (bt_conn_counter < 200)
+				uint8_t *data_p = (uint8_t *)malloc(total_data_buffer_size_bytes * sizeof(uint8_t));
+
+				if (data_p == NULL)
 				{
-					uint8_t *data_p = (uint8_t *)malloc(total_data_buffer_size_bytes * sizeof(uint8_t));
+					LOG_ERR("Failed to allocate memory for sensor data buffer transfer into flash.");
+					LOG_DBG("Unlocking sensor_data_flash_mutex");
+					sensor_data_buffer_size = 0;
+					k_mutex_unlock(&sensor_data_flash_mutex);
+					return NULL;
+				}
 
-					if (data_p == NULL)
+				uint64_t ptr_offset = 0;
+
+				for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
+				{
+
+					for (uint8_t j = 0; j < sizeof(sensor_data->time_delta); j++) // TODO: Remove hardcode
 					{
-						LOG_ERR("Failed to allocate memory for sensor data buffer transfer into flash.");
-						LOG_DBG("Unlocking sensor_data_flash_mutex");
-						sensor_data_buffer_clear();
-
-						k_mutex_unlock(&sensor_data_flash_mutex);
-						return NULL;
+						*(data_p + ptr_offset++) = (sensor_data_buffer[i].time_delta >> (j * 8)) & 0xFF;
 					}
 
-					uint64_t ptr_offset = 0;
+					*(data_p + ptr_offset++) = sensor_data_buffer[i].temperature;
+					*(data_p + ptr_offset++) = sensor_data_buffer[i].humidity;
 
-					for (uint64_t i = 0; i < sensor_data_buffer_size; i++)
+					// TODO: Works only if the data type is of type uint8_t
+					for (uint8_t j = 0; j < FREQUENCY_COMPONENTS_COUNT_MAX; j++)
 					{
-
-						for (uint8_t j = 0; j < sizeof(sensor_data->time_delta); j++) // TODO: Remove hardcode
-						{
-							*(data_p + ptr_offset++) = (sensor_data_buffer[i].time_delta >> (j * 8)) & 0xFF;
-						}
-
-						*(data_p + ptr_offset++) = sensor_data_buffer[i].data_length;
-
-						// TODO: Works only if the data type is of type uint8_t
-						for (uint8_t j = 0; j < sensor_data_buffer[i].data_length; j++)
-						{
-							*(data_p + ptr_offset++) = *(sensor_data_buffer[i].raw_data + j);
-						}
+						*(data_p + ptr_offset++) = *(sensor_data_buffer[i].amplitudes + j);
 					}
+				}
 
-					LOG_DBG("Ending pointer arithmetic.");
+				LOG_DBG("Ending pointer arithmetic.");
 
-					if (ptr_offset != total_data_buffer_size_bytes)
-					{
-						LOG_ERR("Total sensor data length in bytes is not equal to pointer offset.");
-						LOG_DBG("Unlocking sensor_data_flash_mutex");
+				if (ptr_offset != total_data_buffer_size_bytes)
+				{
+					LOG_ERR("Total sensor data length in bytes is not equal to pointer offset.");
+					LOG_DBG("Unlocking sensor_data_flash_mutex");
 
-						sensor_data_buffer_clear();
-
-						k_mutex_unlock(&sensor_data_flash_mutex);
-						free(data_p);
-						return NULL;
-					}
-
-					err = data_append(FILE_SENSOR_DATA_LOCATION, data_p, total_data_buffer_size_bytes);
-					if (err < 0)
-					{
-						LOG_ERR("Failed to append sensor data to flash: %d", err);
-						LOG_DBG("Unlocking sensor_data_flash_mutex");
-
-						sensor_data_buffer_clear();
-
-						k_mutex_unlock(&sensor_data_flash_mutex);
-						free(data_p);
-						return NULL;
-					}
-
-					set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
-					log_total_data_length_in_flash += sensor_data_buffer_size;
-
-					LOG_DBG("Freeing data_p pointer");
+					sensor_data_buffer_size = 0;
+					k_mutex_unlock(&sensor_data_flash_mutex);
 					free(data_p);
-				}
-				else
-				{
-					LOG_WRN("Skip adding to flash.");
+					return NULL;
 				}
 
-				LOG_WRN("before sensor data buffer clear.");
-				sensor_data_buffer_clear();
-				LOG_WRN("after sensor data buffer clear.");
+				err = data_append(FILE_SENSOR_DATA_LOCATION, data_p, total_data_buffer_size_bytes);
+				if (err < 0)
+				{
+					LOG_ERR("Failed to append sensor data to flash: %d", err);
+					LOG_DBG("Unlocking sensor_data_flash_mutex");
+
+					sensor_data_buffer_size = 0;
+
+					k_mutex_unlock(&sensor_data_flash_mutex);
+					free(data_p);
+					return NULL;
+				}
+
+				set_sensor_data_length(get_sensor_data_length() + sensor_data_buffer_size);
+				log_total_data_length_in_flash += sensor_data_buffer_size;
+
+				LOG_DBG("Freeing data_p pointer");
+				free(data_p);
+
+				LOG_DBG("before sensor data buffer clear.");
+				sensor_data_buffer_size = 0;
+				LOG_DBG("after sensor data buffer clear.");
 			}
 			else
 			{
@@ -845,11 +870,11 @@ sensor_data_t *sensor_data_buffer_element_add(sensor_data_t *sensor_data)
 
 	// TODO: Add sensor data mutex
 
-	LOG_WRN("adding to sensor data buffer.");
+	LOG_DBG("adding to sensor data buffer.");
 
 	sensor_data_buffer[sensor_data_buffer_size++] = *sensor_data;
 
-	LOG_WRN("after adding to sensor data buffer.");
+	LOG_DBG("after adding to sensor data buffer.");
 
 	if (sensor_data_flash_mutex_locked)
 	{
@@ -878,71 +903,6 @@ sensor_data_t *sensor_data_buffer_element_get(size_t index)
 	return &sensor_data_buffer[index];
 }
 
-bool sensor_data_buffer_element_remove(size_t index)
-{
-	if (index >= sensor_data_buffer_size)
-	{
-		LOG_ERR("Failed to remove sensor data element at index %d. Index is out of bounds of sensor_data_buffer_size (%u)", index, sensor_data_buffer_size);
-		return false;
-	}
-
-	// FIXME: Circular buffer please.
-
-	int err = k_mutex_lock(&sensor_data_flash_mutex, K_FOREVER);
-
-	if (err < 0)
-	{
-		LOG_ERR("Failed to lock sensor data buffer mutex. Err %d", err);
-		return false;
-	}
-
-	free(sensor_data_buffer[index].raw_data);
-
-	sensor_data_buffer[index].raw_data = NULL;
-
-	k_mutex_unlock(&sensor_data_flash_mutex);
-
-	sensor_data_buffer_size--;
-
-	LOG_INF("Sensor data buffer element at index %d removed.", index);
-
-	return true;
-}
-
-bool sensor_data_buffer_clear()
-{
-	if (sensor_data_buffer_size == 0)
-	{
-		return true;
-	}
-
-	int err = k_mutex_lock(&sensor_data_flash_mutex, K_FOREVER);
-
-	if (err < 0)
-	{
-		LOG_ERR("Failed to lock sensor data buffer mutex. Err %d", err);
-		return false;
-	}
-
-	LOG_WRN("before sensor data buffer clear loop.");
-
-	for (size_t i = 0; i < sensor_data_buffer_size; i++)
-	{
-		free(sensor_data_buffer[i].raw_data);
-		sensor_data_buffer[i].raw_data = NULL;
-	}
-
-	LOG_WRN("after sensor data buffer clear loop.");
-
-	k_mutex_unlock(&sensor_data_flash_mutex);
-
-	sensor_data_buffer_size = 0;
-
-	LOG_INF("Sensor data buffer cleared.");
-
-	return true;
-}
-
 // ------- BLINK --------
 
 struct k_work_delayable work_blink;
@@ -963,19 +923,8 @@ static void cb_bt_ready(int err)
 		return;
 	}
 
-	err = settings_load();
-	if (err == 0)
-	{
-		LOG_INF("main: Settings loaded!");
-	}
-	else
-	{
-		LOG_ERR("main: Failed to load settings. Err %d.", err);
-	}
-
-	
 	LOG_DBG("Checking and creating BT identity.");
-	
+
 	uint8_t addr[] = BLE_STATIC_ADDR;
 
 	addr[5] |= 0xC0;
@@ -988,16 +937,6 @@ static void cb_bt_ready(int err)
 
 	size_t count = CONFIG_BT_ID_MAX;
 	bt_addr_le_t read_addr[CONFIG_BT_ID_MAX];
-	bt_id_get(read_addr, &count);
-	if (count > 0)
-	{
-		LOG_INF("%d BLE addresses available. Using BLE addr: %02X:%02X:%02X:%02X:%02X:%02X", count,
-				read_addr[0].a.val[5], read_addr[0].a.val[4], read_addr[0].a.val[3], read_addr[0].a.val[2], read_addr[0].a.val[1], read_addr[0].a.val[0]);
-	}
-	else
-	{
-		LOG_ERR("Can't get BLE addr. Err %d (%s)", count, bt_att_err_to_str(count));
-	}
 
 	err = bt_id_create(&le_addr, NULL);
 	if (err < 0)
@@ -1010,7 +949,6 @@ static void cb_bt_ready(int err)
 		LOG_INF("Static BT identity %d created.", err);
 	}
 
-	
 	bt_id_get(read_addr, &count);
 	if (count > 0)
 	{
@@ -1022,44 +960,106 @@ static void cb_bt_ready(int err)
 		LOG_ERR("Can't get BLE addr. Err %d (%s)", count, bt_att_err_to_str(count));
 	}
 
+	err = settings_load();
+	if (err == 0)
+	{
+		LOG_INF("main: Settings loaded!");
+	}
+	else
+	{
+		LOG_ERR("main: Failed to load settings. Err %d.", err);
+	}
+
 	advertising_ready = true;
 
 	LOG_INF("Bluetooth initialized");
 }
 
-bool gen_working = false;
-
-struct k_work_delayable work_sensor_data_gen_delayable;
-
-void cb_gpio_data_gen_scheduled(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+void cb_button0(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
-	if (gen_working)
+	if (button0_pressed == false)
 	{
-		k_work_cancel_delayable(&work_sensor_data_gen_delayable);
-		gen_working = false;
-		LOG_INF("DATA GEN CANCELLED.");
+		button0_pressed = true;
+		k_work_schedule(&work_button0_debounce, K_MSEC(GPIO_DEBOUNCE_TIME_MS));
+
+		if (advertising_ready)
+		{
+			LOG_DBG("Advertising work submitted.");
+			k_work_schedule(&work_adv, K_NO_WAIT);
+		}
+		else
+		{
+			LOG_INF("Can't manually start advertising, advertising is not ready.");
+		}
 	}
-	else
+}
+
+void cb_button1(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+{
+	if (button1_pressed == false)
 	{
-		LOG_INF("DATA GEN STARTED.");
-		k_work_schedule(&work_sensor_data_gen_delayable, K_NO_WAIT);
-		gen_working = true;
+		button1_pressed = true;
+		k_work_schedule(&work_button1_debounce, K_MSEC(GPIO_DEBOUNCE_TIME_MS));
+		// function call here
 	}
 }
 
-void cb_gpio_data_gen(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+void cb_button2(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
-	k_work_submit(&work_sensor_data_gen);
+	if (button2_pressed == false)
+	{
+		button2_pressed = true;
+		k_work_schedule(&work_button2_debounce, K_MSEC(GPIO_DEBOUNCE_TIME_MS));
+		// function call here
+
+		k_work_submit(&work_sensor_data_gen);
+	}
 }
 
-static struct k_work work_gpio_irq_log;
-
-void cb_gpio_adv(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
+void cb_button3(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
 {
-	k_work_submit(&work_gpio_irq_log);
+	if (button3_pressed == false)
+	{
+		button3_pressed = true;
+		k_work_schedule(&work_button3_debounce, K_MSEC(GPIO_DEBOUNCE_TIME_MS));
+		// function call here
+
+		if (gen_working)
+		{
+			k_work_cancel_delayable(&work_sensor_data_gen_delayable);
+			gen_working = false;
+			LOG_INF("DATA GEN CANCELLED.");
+		}
+		else
+		{
+			LOG_INF("DATA GEN STARTED.");
+			k_work_schedule(&work_sensor_data_gen_delayable, K_NO_WAIT);
+			gen_working = true;
+		}
+	}
 }
 
-int gpio_init()
+void cb_button0_debounce_handler()
+{
+	button0_pressed = false;
+}
+
+void cb_button1_debounce_handler()
+{
+	button1_pressed = false;
+}
+
+void cb_button2_debounce_handler()
+{
+	button2_pressed = false;
+}
+
+void cb_button3_debounce_handler()
+{
+	button3_pressed = false;
+}
+
+int init_gpio()
 {
 	int err;
 
@@ -1116,7 +1116,8 @@ int gpio_init()
 		LOG_ERR("GPIO button0 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button0_cb, cb_gpio_adv, BIT(button0.pin));
+	k_work_init_delayable(&work_button0_debounce, cb_button0_debounce_handler);
+	gpio_init_callback(&button0_cb, cb_button0, BIT(button0.pin));
 	gpio_add_callback(button0.port, &button0_cb);
 	if (err < 0)
 	{
@@ -1136,7 +1137,8 @@ int gpio_init()
 		LOG_ERR("GPIO button1 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button1_cb, NULL, BIT(button1.pin));
+	k_work_init_delayable(&work_button1_debounce, cb_button1_debounce_handler);
+	gpio_init_callback(&button1_cb, cb_button1, BIT(button1.pin));
 	gpio_add_callback(button1.port, &button1_cb);
 	if (err < 0)
 	{
@@ -1156,7 +1158,8 @@ int gpio_init()
 		LOG_ERR("GPIO button2 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button2_cb, cb_gpio_data_gen_scheduled, BIT(button2.pin));
+	k_work_init_delayable(&work_button2_debounce, cb_button2_debounce_handler);
+	gpio_init_callback(&button2_cb, cb_button2, BIT(button2.pin));
 	gpio_add_callback(button2.port, &button2_cb);
 	if (err < 0)
 	{
@@ -1176,7 +1179,8 @@ int gpio_init()
 		LOG_ERR("GPIO button3 int config failed. Err %d", err);
 	}
 
-	gpio_init_callback(&button3_cb, cb_gpio_data_gen, BIT(button3.pin));
+	k_work_init_delayable(&work_button3_debounce, cb_button3_debounce_handler);
+	gpio_init_callback(&button3_cb, cb_button3, BIT(button3.pin));
 	gpio_add_callback(button3.port, &button3_cb);
 	if (err < 0)
 	{
@@ -1197,18 +1201,6 @@ void work_sensor_data_gen_handler()
 	for (int i = 0; i < 300; i++)
 	{
 		sensor_data_buffer_element_add(sensor_data_generate());
-	}
-}
-
-void work_gpio_irq_log_handler()
-{
-	if (advertising_ready)
-	{
-		cb_advertising_start();
-	}
-	else
-	{
-		LOG_INF("Can't manually start advertising, advertising is not ready.");
 	}
 }
 
@@ -1275,7 +1267,7 @@ int init_all()
 
 	print_zephyr_fs_details();
 
-	err = gpio_init();
+	err = init_gpio();
 	if (err < 0)
 	{
 		LOG_ERR("GPIO init failed.");
@@ -1284,7 +1276,6 @@ int init_all()
 	LOG_INF("GPIO init complete.");
 
 	k_work_init(&work_sensor_data_gen, work_sensor_data_gen_handler);
-	k_work_init(&work_gpio_irq_log, work_gpio_irq_log_handler);
 	k_work_init_delayable(&work_adv, work_adv_handler);
 	k_work_init_delayable(&work_blink, work_blink_handler);
 	k_work_schedule(&work_blink, K_NO_WAIT);

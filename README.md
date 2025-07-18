@@ -5,15 +5,16 @@
 Code for nRF54l15 SoC on an nRF54l15dk board for low power logging and data transfer of a MEMS microphone.
 
 ## To Do
-deep sleep during timeout (partially -> bt disable)
+deep sleep during timeout (done for BT, todo device suspend to ram)
 
-Data circular file
-local adv interval
-check for space left before appending, otherwise only some bytes might get appended.
-button debouncing
-read retry on partial data read
 real data format
+local adv interval
+read retry on partial data read
+check for space left before appending, otherwise only some bytes might get appended. Data circular file.
+test without using read confirmation characteristic, instead cycle data assuming the transfer happened.
 
+
+button debouncing (done)
 MTU defining packet size instead of a hardcoded value (done)
 fix long data read transfer length issues (done)
 calculate remaining memory percentage (done)
